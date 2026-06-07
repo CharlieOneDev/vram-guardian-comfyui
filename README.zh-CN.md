@@ -17,10 +17,57 @@
 
 ## 运行 Guardian sidecar
 
-前提：Linux 或 WSL2 Docker，并已安装 NVIDIA Container Toolkit。
+前提条件：
+
+- 宿主机能看到 NVIDIA GPU。用 `nvidia-smi` 检查。
+- 已安装 Docker 和 Docker Compose。用 `docker --version` 和 `docker compose version` 检查。
+- Docker 能访问 GPU。用下面的命令检查：
 
 ```bash
-cd /path/to/vram-guardian-comfyui
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+如果这个命令能打印 `nvidia-smi` 的 GPU 表格，说明 Docker 可以使用 GPU，这个项目就可以跑。如果失败，需要先修 Docker GPU 访问，再启动 Guardian。
+
+Windows 上建议使用 Docker Desktop，并启用 WSL2 backend。Docker 官方文档说明，Docker Desktop for Windows 的 GPU 支持依赖 WSL2 backend；Docker Engine 文档也说明了用 `--gpus` 把 NVIDIA GPU 暴露给容器。原生 Linux 上需要安装并配置 NVIDIA Container Toolkit。参考：
+
+- Docker GPU access: <https://docs.docker.com/engine/containers/gpu/>
+- Docker Desktop GPU support: <https://docs.docker.com/desktop/features/gpu/>
+- NVIDIA Container Toolkit 安装文档: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
+- NVIDIA sample workload 检查: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/sample-workload.html>
+
+如果 Linux 里还没安装 NVIDIA Container Toolkit，按 NVIDIA 官方安装文档安装后，通常还需要执行：
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+`/path/to/vram-guardian-comfyui` 的意思是“这个仓库所在目录”，也就是包含本 README 和 `docker-compose.yml` 的那个目录。
+
+如果你还没有拉取仓库，先执行：
+
+```bash
+git clone https://github.com/CharlieOneDev/vram-guardian-comfyui.git
+cd vram-guardian-comfyui
+```
+
+如果你使用的是我之前创建在 `G:\codex` 下面的本地目录，在 Windows PowerShell 里是：
+
+```powershell
+cd G:\codex\vram-guardian-comfyui
+```
+
+如果你在 WSL 终端里访问同一个 Windows 盘符，通常是：
+
+```bash
+cd /mnt/g/codex/vram-guardian-comfyui
+```
+
+然后启动 Guardian：
+
+```bash
 docker compose up -d --build
 ```
 

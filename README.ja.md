@@ -17,10 +17,57 @@ ComfyUI が OOM になったときに CUDA VRAM を解放して再試行でき�
 
 ## Guardian sidecar の起動
 
-前提条件: Linux または WSL2 の Docker と NVIDIA Container Toolkit。
+前提条件:
+
+- ホストから NVIDIA GPU が見えること。`nvidia-smi` で確認します。
+- Docker と Docker Compose が入っていること。`docker --version` と `docker compose version` で確認します。
+- Docker から GPU にアクセスできること。次のコマンドで確認します。
 
 ```bash
-cd /path/to/vram-guardian-comfyui
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+このコマンドで `nvidia-smi` の GPU テーブルが表示されれば、Docker から GPU を利用できます。失敗する場合は、Guardian を起動する前に Docker の GPU アクセスを直してください。
+
+Windows では Docker Desktop の WSL2 backend を使ってください。Docker の公式ドキュメントでは、Docker Desktop for Windows の GPU support は WSL2 backend で利用できると説明されています。また Docker Engine のドキュメントでは、`--gpus` flag で NVIDIA GPU をコンテナへ公開する方法が説明されています。ネイティブ Linux では NVIDIA Container Toolkit をインストールして Docker に設定します。参考:
+
+- Docker GPU access: <https://docs.docker.com/engine/containers/gpu/>
+- Docker Desktop GPU support: <https://docs.docker.com/desktop/features/gpu/>
+- NVIDIA Container Toolkit install guide: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
+- NVIDIA sample workload check: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/sample-workload.html>
+
+Linux で NVIDIA Container Toolkit が未インストールの場合は、NVIDIA の公式ガイドに従ってインストールしたあと、通常は次を実行します。
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+`/path/to/vram-guardian-comfyui` は、この README と `docker-compose.yml` があるリポジトリのディレクトリを指します。
+
+まだリポジトリを clone していない場合:
+
+```bash
+git clone https://github.com/CharlieOneDev/vram-guardian-comfyui.git
+cd vram-guardian-comfyui
+```
+
+以前作成した `G:\codex` 下のローカルコピーを使う場合、Windows PowerShell では:
+
+```powershell
+cd G:\codex\vram-guardian-comfyui
+```
+
+WSL terminal から同じ Windows drive を使う場合は、通常:
+
+```bash
+cd /mnt/g/codex/vram-guardian-comfyui
+```
+
+その後 Guardian を起動します。
+
+```bash
 docker compose up -d --build
 ```
 

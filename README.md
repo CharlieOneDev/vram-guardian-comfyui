@@ -15,10 +15,55 @@ This is not a real private VRAM pool. It only makes opportunistic VRAM stealing 
 
 ## Run the Guardian sidecar
 
-Prerequisite: Docker on Linux or WSL2 with NVIDIA Container Toolkit.
+Prerequisites:
+
+- An NVIDIA GPU visible to the host. Check with `nvidia-smi`.
+- Docker and Docker Compose. Check with `docker --version` and `docker compose version`.
+- Docker GPU access. Check with:
 
 ```bash
-cd /path/to/vram-guardian-comfyui
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+If that command prints an `nvidia-smi` GPU table, Docker can see your GPU and this project can run. If it fails, fix Docker GPU access before starting Guardian.
+
+On Windows, use Docker Desktop with the WSL2 backend. Docker documents GPU support for Docker Desktop on Windows with WSL2, and Docker Engine documents the `--gpus` flag for exposing NVIDIA GPUs to containers. On native Linux, install and configure NVIDIA Container Toolkit for Docker. See:
+
+- Docker GPU access: <https://docs.docker.com/engine/containers/gpu/>
+- Docker Desktop GPU support: <https://docs.docker.com/desktop/features/gpu/>
+- NVIDIA Container Toolkit install guide: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
+- NVIDIA sample workload check: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/sample-workload.html>
+
+If NVIDIA Container Toolkit is missing on Linux, follow NVIDIA's install guide, then run:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+docker run --rm --gpus all ubuntu nvidia-smi
+```
+
+`/path/to/vram-guardian-comfyui` means the directory that contains this README and `docker-compose.yml`.
+
+If you have not cloned the repository yet:
+
+```bash
+git clone https://github.com/CharlieOneDev/vram-guardian-comfyui.git
+cd vram-guardian-comfyui
+```
+
+If you are using the local copy created under `G:\codex`, use one of these:
+
+```powershell
+cd G:\codex\vram-guardian-comfyui
+```
+
+```bash
+cd /mnt/g/codex/vram-guardian-comfyui
+```
+
+Then start Guardian:
+
+```bash
 docker compose up -d --build
 ```
 
