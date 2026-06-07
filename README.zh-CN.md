@@ -144,37 +144,46 @@ cd vram-guardian-comfyui
 
 ## 推荐 Scheduler 配置
 
-48GB 共享 GPU 可以从下面配置开始：
+ComfyUI 插件现在默认使用 `heavy-video` scheduler preset。这个 preset 面向重视频工作流：载入视频帧和参考图、pose/control 预处理、Wan/LTX 类视频模型生成、VAE decode、插帧、放大或 VSR。
+
+Guardian 已经运行时，ComfyUI 侧通常只需要：
 
 ```bash
 export VRAM_GUARDIAN_HOST=127.0.0.1
 export VRAM_GUARDIAN_PORT=8765
 export VRAM_GUARDIAN_MAX_RETRY=1
 
-export VRAM_GUARDIAN_SCHEDULER_ENABLE=true
-export VRAM_GUARDIAN_BASE_FREE_MB=6144
-export VRAM_GUARDIAN_HEAVY_FREE_MB=20480
-export VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=1024
-export VRAM_GUARDIAN_WAIT_TIMEOUT_SEC=120
-export VRAM_GUARDIAN_WAIT_POLL_SEC=0.5
-export VRAM_GUARDIAN_MONITOR_INTERVAL_SEC=0.5
-export VRAM_GUARDIAN_OOM_BUMP_MB=4096
-
-export VRAM_GUARDIAN_NODE_FREE_MAP='{
-  "KSampler": 24576,
-  "VAEDecode": 16384,
-  "VAEDecodeTiled": 12288,
-  "UltimateSDUpscale": 24576,
-  "SegmentVSRFIStreamRunner": 24576,
-  "WanVideoSampler": 24576,
-  "LTXVideoSampler": 24576
-}'
-
-export VRAM_GUARDIAN_PROFILE_ENABLE=true
-export VRAM_GUARDIAN_PROFILE_PATH=./vram_guardian_profile.json
-export VRAM_GUARDIAN_PROFILE_MARGIN_MB=2048
-
 python main.py
+```
+
+默认 `heavy-video` 行为：
+
+- Scheduler 默认启用。
+- 基础 workflow 空闲显存目标自动计算：`min(total_vram * 0.62, 28672 MiB)`。
+- 重节点空闲显存目标自动计算：`min(total_vram * 0.72, 32768 MiB)`。
+- 本地 profiling 默认启用，写入 `vram_guardian_profile.json`。
+- 重节点通过宽泛 class-name 模糊匹配识别，例如 `sampler`、`wan`、`ltx`、`bernini`、`video`、`vsr`、`upscale`、`interpol`、`decode`、`vae`、`pose`、`model`。
+
+在 48 GiB/L40 级别 GPU 上，大致相当于：
+
+```text
+base free target:  约 28 GiB
+heavy free target: 约 32 GiB
+```
+
+仍然可以手动覆盖：
+
+```bash
+export VRAM_GUARDIAN_BASE_FREE_MB=32768
+export VRAM_GUARDIAN_HEAVY_FREE_MB=36864
+export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,video,vsr,upscale,interpol,decode,vae,pose,model
+python main.py
+```
+
+如果想恢复旧逻辑，也就是只有显式设置变量才启用 scheduler target，可以设置：
+
+```bash
+export VRAM_GUARDIAN_SCHEDULER_PRESET=manual
 ```
 
 PowerShell 示例：
@@ -182,10 +191,6 @@ PowerShell 示例：
 ```powershell
 $env:VRAM_GUARDIAN_HOST = "127.0.0.1"
 $env:VRAM_GUARDIAN_PORT = "8765"
-$env:VRAM_GUARDIAN_SCHEDULER_ENABLE = "true"
-$env:VRAM_GUARDIAN_BASE_FREE_MB = "6144"
-$env:VRAM_GUARDIAN_HEAVY_FREE_MB = "20480"
-$env:VRAM_GUARDIAN_NODE_FREE_MAP = '{"KSampler":24576,"VAEDecode":16384}'
 python main.py
 ```
 
@@ -194,7 +199,7 @@ python main.py
 1. ComfyUI 开始执行 prompt 时，插件开启 base watermark。
 2. 普通节点使用 `BASE_FREE_MB` 作为基础空闲显存目标。
 3. 如果节点 class 命中 `NODE_FREE_MAP`，插件会把目标 free 提高到对应值。
-4. 如果节点 class 在 `HEAVY_NODES` 中但没有 map，则使用 `HEAVY_FREE_MB`。
+4. 如果节点 class 在 `HEAVY_NODES` 中，或命中 `HEAVY_PATTERNS`，则使用 `HEAVY_FREE_MB`。
 5. 节点执行前，插件调用 Guardian 的 `ensure_free`，让 Guardian 释放到目标 free。
 6. 如果 free 不够，插件会等待，并周期性打印日志。
 7. 节点运行中，Guardian 保持该节点目标水位。
@@ -216,17 +221,23 @@ Guardian 进程：
 
 ComfyUI 插件：
 
-- `VRAM_GUARDIAN_SCHEDULER_ENABLE`: 启用 Scheduler。
-- `VRAM_GUARDIAN_BASE_FREE_MB`: 普通阶段目标空闲显存。
-- `VRAM_GUARDIAN_HEAVY_FREE_MB`: 未单独配置的重节点目标空闲显存。
+- `VRAM_GUARDIAN_SCHEDULER_PRESET`: scheduler preset，默认 `heavy-video`。设置为 `manual` 或 `off` 可关闭自动 heavy-video 默认值。
+- `VRAM_GUARDIAN_SCHEDULER_ENABLE`: 启用 Scheduler，`heavy-video` 下默认启用。
+- `VRAM_GUARDIAN_BASE_FREE_MB`: 显式基础空闲显存目标。未设置时，`heavy-video` 使用 `min(total_vram * 0.62, 28672 MiB)`。
+- `VRAM_GUARDIAN_HEAVY_FREE_MB`: 显式重节点空闲显存目标。未设置时，`heavy-video` 使用 `min(total_vram * 0.72, 32768 MiB)`。
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: 自动基础目标比例，默认 `0.62`。
+- `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: 自动重节点目标比例，默认 `0.72`。
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: 自动基础目标上限，默认 `28672`。
+- `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: 自动重节点目标上限，默认 `32768`。
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: 节点 class 到目标 free 的 JSON 映射。
 - `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class。
+- `VRAM_GUARDIAN_HEAVY_PATTERNS`: 逗号分隔的小写 class-name 片段，匹配到就按重节点处理。`heavy-video` 下默认是视频工作流常见关键词。
 - `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: 高水位回填缓冲区。
 - `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: 节点开始前最长等待时间，`0` 表示无限等待。
 - `VRAM_GUARDIAN_WAIT_POLL_SEC`: 等待轮询间隔。
 - `VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC`: 等待日志间隔。
 - `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: 节点运行期间采样间隔。
-- `VRAM_GUARDIAN_PROFILE_ENABLE`: 启用本地 profile。
+- `VRAM_GUARDIAN_PROFILE_ENABLE`: 启用本地 profile，`heavy-video` 下默认启用。
 - `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON 路径，默认 `vram_guardian_profile.json`。
 - `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: profile 学习结果额外安全边距。
 - `VRAM_GUARDIAN_OOM_BUMP_MB`: OOM 后下次目标提高量。
@@ -237,27 +248,27 @@ ComfyUI 插件：
 Guardian 日志会显示总显存、空闲显存、Guardian 占用、ComfyUI 占用和其他进程占用：
 
 ```text
-total=45458MiB free=6144MiB guardian_held=32768MiB target=40960MiB external_calc=6546MiB guardian_proc=33024MiB comfyui=2048MiB other=4498MiB paused=0s
+total=45458MiB free=28672MiB guardian_held=9216MiB target=37275MiB external_calc=7570MiB guardian_proc=9472MiB comfyui=4096MiB other=3474MiB paused=0s
 ```
 
 Scheduler 日志示例：
 
 ```text
-[VRAM Scheduler] node=KSampler#12 class=KSampler target_free=24576MiB source=node-map
-[VRAM Scheduler] KSampler#12 waiting: free=8192MiB target=24576MiB guardian_held=16384MiB
-[VRAM Scheduler] KSampler#12 free reached 24600MiB target=24576MiB; continuing
+[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
+[VRAM Scheduler] WanVideoSampler#12 waiting: free=28672MiB target=32768MiB guardian_held=4096MiB
+[VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
 
 如果 Guardian 已经释放完但 free 仍然不足，说明可能有外部进程占用：
 
 ```text
-[VRAM Scheduler] KSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
+[VRAM Scheduler] WanVideoSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
 ```
 
 ## 调参建议
 
-- 普通节点 OOM：提高 `BASE_FREE_MB`。
-- 某个重节点 OOM：提高 `NODE_FREE_MAP` 中该节点的值。
-- 防抢占不够强：降低 `BASE_FREE_MB` 或提高 `VRAM_GUARDIAN_FRACTION`。
+- 重视频工作流 OOM：提高 `BASE_FREE_MB` 或 `HEAVY_FREE_MB`。
+- 日志显示某个特定 class 反复 OOM：再给 `NODE_FREE_MAP` 加单独目标。
+- 防抢占不够强：降低 `BASE_FREE_MB`、`HEAVY_FREE_MB` 或自动上限，或者提高 `VRAM_GUARDIAN_FRACTION`。
 - 不想长时间等待：降低 `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`。
 - 想让配置越跑越准：启用 `VRAM_GUARDIAN_PROFILE_ENABLE`。

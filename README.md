@@ -27,8 +27,8 @@ Simple mode:
 
 Scheduler mode:
 
-1. A workflow starts with a low base free-VRAM target, such as `6144` or `8192` MiB.
-2. Before a known heavy node runs, the plugin raises the free-VRAM target.
+1. A workflow starts with an automatic base free-VRAM target.
+2. Before a heavy video, sampler, model, VAE, pose, upscale, interpolation, or VSR node runs, the plugin raises the free-VRAM target.
 3. Guardian releases enough held memory before the node starts.
 4. The plugin waits until the target free VRAM is reached, or until a configurable timeout.
 5. During the node, Guardian keeps the higher target and only refills surplus above `target + hysteresis`.
@@ -154,48 +154,49 @@ Restart ComfyUI after installing or updating the plugin.
 
 ## Recommended Scheduler Configuration
 
-For a 48 GiB shared GPU, a practical starting point is:
+The ComfyUI plugin now defaults to the `heavy-video` scheduler preset. This preset is designed for workflows that load video frames and reference images, run pose/control preprocessing, generate with Wan/LTX-style video models, then decode, interpolate, upscale, or VSR the result.
+
+With Guardian already running, the ComfyUI side can usually start with only:
 
 ```bash
 export VRAM_GUARDIAN_HOST=127.0.0.1
 export VRAM_GUARDIAN_PORT=8765
 export VRAM_GUARDIAN_MAX_RETRY=1
 
-export VRAM_GUARDIAN_SCHEDULER_ENABLE=true
-export VRAM_GUARDIAN_BASE_FREE_MB=6144
-export VRAM_GUARDIAN_HEAVY_FREE_MB=20480
-export VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=1024
-export VRAM_GUARDIAN_WAIT_TIMEOUT_SEC=120
-export VRAM_GUARDIAN_WAIT_POLL_SEC=0.5
-export VRAM_GUARDIAN_MONITOR_INTERVAL_SEC=0.5
-export VRAM_GUARDIAN_OOM_BUMP_MB=4096
-
-export VRAM_GUARDIAN_NODE_FREE_MAP='{
-  "KSampler": 24576,
-  "VAEDecode": 16384,
-  "VAEDecodeTiled": 12288,
-  "UltimateSDUpscale": 24576,
-  "SegmentVSRFIStreamRunner": 24576,
-  "WanVideoSampler": 24576,
-  "LTXVideoSampler": 24576
-}'
-
-export VRAM_GUARDIAN_PROFILE_ENABLE=true
-export VRAM_GUARDIAN_PROFILE_PATH=./vram_guardian_profile.json
-export VRAM_GUARDIAN_PROFILE_MARGIN_MB=2048
-
 python main.py
 ```
 
-For Windows PowerShell, set the same values with `$env:`:
+Default `heavy-video` behavior:
+
+- Scheduler mode is enabled by default.
+- Base workflow free target is automatic: `min(total_vram * 0.62, 28672 MiB)`.
+- Heavy node free target is automatic: `min(total_vram * 0.72, 32768 MiB)`.
+- Local profiling is enabled by default and writes `vram_guardian_profile.json`.
+- Heavy nodes are detected by broad class-name patterns such as `sampler`, `wan`, `ltx`, `bernini`, `video`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, and `model`.
+
+For a 48 GiB/L40-class GPU this means roughly:
+
+```text
+base free target:  about 28 GiB
+heavy free target: about 32 GiB
+```
+
+Manual overrides are still available:
+
+```bash
+export VRAM_GUARDIAN_BASE_FREE_MB=32768
+export VRAM_GUARDIAN_HEAVY_FREE_MB=36864
+export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,video,vsr,upscale,interpol,decode,vae,pose,model
+python main.py
+```
+
+Set `VRAM_GUARDIAN_SCHEDULER_PRESET=manual` if you want the old behavior where scheduler targets are only enabled by explicit variables.
+
+For Windows PowerShell:
 
 ```powershell
 $env:VRAM_GUARDIAN_HOST = "127.0.0.1"
 $env:VRAM_GUARDIAN_PORT = "8765"
-$env:VRAM_GUARDIAN_SCHEDULER_ENABLE = "true"
-$env:VRAM_GUARDIAN_BASE_FREE_MB = "6144"
-$env:VRAM_GUARDIAN_HEAVY_FREE_MB = "20480"
-$env:VRAM_GUARDIAN_NODE_FREE_MAP = '{"KSampler":24576,"VAEDecode":16384}'
 python main.py
 ```
 
@@ -216,17 +217,23 @@ Guardian process:
 
 ComfyUI plugin:
 
-- `VRAM_GUARDIAN_SCHEDULER_ENABLE`: enable Scheduler mode. Default: enabled when scheduler targets are configured.
-- `VRAM_GUARDIAN_BASE_FREE_MB`: base free-VRAM target for ordinary workflow execution.
-- `VRAM_GUARDIAN_HEAVY_FREE_MB`: default target for heavy nodes that are listed but not mapped.
+- `VRAM_GUARDIAN_SCHEDULER_PRESET`: preset name. Default: `heavy-video`. Use `manual` or `off` to disable automatic heavy-video defaults.
+- `VRAM_GUARDIAN_SCHEDULER_ENABLE`: enable Scheduler mode. Default: `true` under the `heavy-video` preset.
+- `VRAM_GUARDIAN_BASE_FREE_MB`: explicit base free-VRAM target. If unset, `heavy-video` uses `min(total_vram * 0.62, 28672 MiB)`.
+- `VRAM_GUARDIAN_HEAVY_FREE_MB`: explicit heavy-node target. If unset, `heavy-video` uses `min(total_vram * 0.72, 32768 MiB)`.
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: automatic base target fraction. Default: `0.62`.
+- `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: automatic heavy target fraction. Default: `0.72`.
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base target cap. Default: `28672`.
+- `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: automatic heavy target cap. Default: `32768`.
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: JSON object mapping node class names to target free MiB.
 - `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated heavy node class names using `HEAVY_FREE_MB`.
+- `VRAM_GUARDIAN_HEAVY_PATTERNS`: comma-separated lowercase class-name substrings treated as heavy nodes. Defaults to a video-oriented set under `heavy-video`.
 - `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: surplus band before Guardian refills during a high target.
 - `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: maximum wait before a node starts. `0` means wait indefinitely.
 - `VRAM_GUARDIAN_WAIT_POLL_SEC`: wait-loop polling interval.
 - `VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC`: repeated wait-log interval.
 - `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: node runtime sampling interval for profiling.
-- `VRAM_GUARDIAN_PROFILE_ENABLE`: write local profile data.
+- `VRAM_GUARDIAN_PROFILE_ENABLE`: write local profile data. Default: `true` under `heavy-video`.
 - `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON path. Default: `vram_guardian_profile.json`.
 - `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: extra margin added to learned targets.
 - `VRAM_GUARDIAN_OOM_BUMP_MB`: target increase after OOM.
@@ -245,28 +252,28 @@ Legacy plugin controls remain available:
 Guardian logs include compact VRAM summaries:
 
 ```text
-total=45458MiB free=6144MiB guardian_held=32768MiB target=40960MiB external_calc=6546MiB guardian_proc=33024MiB comfyui=2048MiB other=4498MiB paused=0s
+total=45458MiB free=28672MiB guardian_held=9216MiB target=37275MiB external_calc=7570MiB guardian_proc=9472MiB comfyui=4096MiB other=3474MiB paused=0s
 ```
 
 Scheduler logs use the `[VRAM Scheduler]` prefix:
 
 ```text
-[VRAM Scheduler] node=KSampler#12 class=KSampler target_free=24576MiB source=node-map
-[VRAM Scheduler] KSampler#12 waiting: free=8192MiB target=24576MiB guardian_held=16384MiB
-[VRAM Scheduler] KSampler#12 free reached 24600MiB target=24576MiB; continuing
+[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
+[VRAM Scheduler] WanVideoSampler#12 waiting: free=28672MiB target=32768MiB guardian_held=4096MiB
+[VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
 
 If Guardian has released all held memory and the target is still not available:
 
 ```text
-[VRAM Scheduler] KSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
+[VRAM Scheduler] WanVideoSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
 ```
 
 ## Tuning Notes
 
-- Increase `BASE_FREE_MB` if ordinary nodes still OOM.
-- Increase a node's value in `NODE_FREE_MAP` if it needs more burst memory.
-- Lower `BASE_FREE_MB` if protection against other users is more important than latency.
+- Increase `BASE_FREE_MB` or `HEAVY_FREE_MB` if heavy video workflows still OOM.
+- Add a node to `NODE_FREE_MAP` only when logs show a specific class needs a custom target.
+- Lower `BASE_FREE_MB`, `HEAVY_FREE_MB`, or the automatic caps if protection against other users is more important than latency.
 - Lower `WAIT_TIMEOUT_SEC` if workloads should fail fast when the GPU is already occupied.
 - Enable profiling only when you want the plugin to write local learning data.
 

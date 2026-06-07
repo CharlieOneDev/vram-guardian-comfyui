@@ -31,9 +31,25 @@ def _env_int(name: str, default: int) -> int:
     return default if value is None or value == "" else int(value)
 
 
+def _env_has_value(name: str) -> bool:
+    value = os.getenv(name)
+    return value is not None and value != ""
+
+
 def _env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     return default if value is None or value == "" else float(value)
+
+
+def _env_name_set(name: str) -> set[str]:
+    return {value.strip() for value in os.getenv(name, "").split(",") if value.strip()}
+
+
+def _env_pattern_set(name: str, default: set[str]) -> set[str]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return {part.strip().lower() for part in value.split(",") if part.strip()}
 
 
 def _env_int_map(name: str) -> dict[str, int]:
@@ -73,17 +89,53 @@ ACTIVE_FREE_MB = _env_int("VRAM_GUARDIAN_ACTIVE_FREE_MB", 0)
 ACTIVE_HYSTERESIS_MB = _env_int("VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB", 2048)
 ACTIVE_RECLAIM_ON_EXIT = _env_bool("VRAM_GUARDIAN_ACTIVE_RECLAIM_ON_EXIT", True)
 ACTIVE_SCOPE = os.getenv("VRAM_GUARDIAN_ACTIVE_SCOPE", "prompt").strip().lower()
-HEAVY_NODES = {name.strip() for name in os.getenv("VRAM_GUARDIAN_HEAVY_NODES", "").split(",") if name.strip()}
+SCHEDULER_PRESET = os.getenv("VRAM_GUARDIAN_SCHEDULER_PRESET", "heavy-video").strip().lower()
+SCHEDULER_AUTO_PRESET = SCHEDULER_PRESET in {"auto", "default", "heavy", "heavy-video", "video"}
+SCHEDULER_OFF_PRESET = SCHEDULER_PRESET in {"0", "false", "manual", "no", "off", "disabled"}
+HEAVY_NODES = _env_name_set("VRAM_GUARDIAN_HEAVY_NODES")
+DEFAULT_HEAVY_PATTERNS = {
+    "bernini",
+    "controlnet",
+    "decode",
+    "dwpose",
+    "interpol",
+    "loader",
+    "ltx",
+    "model",
+    "pose",
+    "preprocessor",
+    "rife",
+    "rif",
+    "sampler",
+    "segment",
+    "upscale",
+    "vae",
+    "video",
+    "vsr",
+    "wan",
+}
+HEAVY_PATTERNS = _env_pattern_set("VRAM_GUARDIAN_HEAVY_PATTERNS", DEFAULT_HEAVY_PATTERNS if SCHEDULER_AUTO_PRESET else set())
+BASE_FREE_MB_SET = _env_has_value("VRAM_GUARDIAN_BASE_FREE_MB")
 BASE_FREE_MB = _env_int("VRAM_GUARDIAN_BASE_FREE_MB", 0)
+HEAVY_FREE_MB_SET = _env_has_value("VRAM_GUARDIAN_HEAVY_FREE_MB")
 HEAVY_FREE_MB = _env_int("VRAM_GUARDIAN_HEAVY_FREE_MB", ACTIVE_FREE_MB)
+AUTO_BASE_FREE_FRACTION = _env_float("VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION", 0.62)
+AUTO_HEAVY_FREE_FRACTION = _env_float("VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION", 0.72)
+AUTO_BASE_FREE_CAP_MB = _env_int("VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB", 28672)
+AUTO_HEAVY_FREE_CAP_MB = _env_int("VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB", 32768)
+AUTO_FREE_RESERVE_MB = _env_int("VRAM_GUARDIAN_AUTO_FREE_RESERVE_MB", 2048)
 NODE_FREE_MAP = _env_int_map("VRAM_GUARDIAN_NODE_FREE_MAP")
-SCHEDULER_ENABLE = _env_bool("VRAM_GUARDIAN_SCHEDULER_ENABLE", BASE_FREE_MB > 0 or HEAVY_FREE_MB > 0 or bool(NODE_FREE_MAP))
+SCHEDULER_ENABLE = _env_bool(
+    "VRAM_GUARDIAN_SCHEDULER_ENABLE",
+    not SCHEDULER_OFF_PRESET
+    and (SCHEDULER_AUTO_PRESET or BASE_FREE_MB > 0 or HEAVY_FREE_MB > 0 or bool(NODE_FREE_MAP)),
+)
 SCHEDULER_WAIT_TIMEOUT = _env_float("VRAM_GUARDIAN_WAIT_TIMEOUT_SEC", 120.0)
 SCHEDULER_WAIT_POLL = _env_float("VRAM_GUARDIAN_WAIT_POLL_SEC", 0.5)
 SCHEDULER_LOG_INTERVAL = _env_float("VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC", 5.0)
 SCHEDULER_MONITOR_INTERVAL = _env_float("VRAM_GUARDIAN_MONITOR_INTERVAL_SEC", 0.5)
 OOM_BUMP_MB = _env_int("VRAM_GUARDIAN_OOM_BUMP_MB", 4096)
-PROFILE_ENABLE = _env_bool("VRAM_GUARDIAN_PROFILE_ENABLE", False)
+PROFILE_ENABLE = _env_bool("VRAM_GUARDIAN_PROFILE_ENABLE", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
 PROFILE_PATH = Path(os.getenv("VRAM_GUARDIAN_PROFILE_PATH", "vram_guardian_profile.json"))
 PROFILE_MARGIN_MB = _env_int("VRAM_GUARDIAN_PROFILE_MARGIN_MB", 2048)
 PROMPT_SCOPES = {"prompt", "workflow", "comfyui"}
@@ -93,6 +145,7 @@ _PROMPT_WATERMARK_LABEL: str | None = None
 _PROMPT_SCOPE_PATCHED = False
 _PROFILE_LOCK = threading.RLock()
 _PROFILE_DATA: dict[str, Any] = {}
+_TOTAL_MB_CACHE: float | None = None
 
 
 def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
@@ -111,6 +164,83 @@ def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
 
 def _guardian_status() -> dict[str, Any] | None:
     return _guardian_request("status")
+
+
+def _status_total_mb(status: dict[str, Any] | None) -> float:
+    if not status:
+        return 0.0
+    try:
+        return float(status.get("total_mb", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _guardian_total_mb(status: dict[str, Any] | None = None) -> float:
+    global _TOTAL_MB_CACHE
+
+    total_mb = _status_total_mb(status)
+    if total_mb > 0:
+        _TOTAL_MB_CACHE = total_mb
+        return total_mb
+    if _TOTAL_MB_CACHE is not None and _TOTAL_MB_CACHE > 0:
+        return _TOTAL_MB_CACHE
+
+    total_mb = _status_total_mb(_guardian_status())
+    if total_mb > 0:
+        _TOTAL_MB_CACHE = total_mb
+        return total_mb
+
+    try:
+        if torch.cuda.is_available():
+            _, total_bytes = torch.cuda.mem_get_info()
+            total_mb = total_bytes / (1024 * 1024)
+            _TOTAL_MB_CACHE = total_mb
+            return total_mb
+    except Exception:
+        LOG.debug("failed to read local CUDA memory info", exc_info=True)
+    return 0.0
+
+
+def _rounded_target_mb(value: float) -> int:
+    if value <= 0:
+        return 0
+    return max(512, int(value // 512) * 512)
+
+
+def _auto_free_target_mb(kind: str, status: dict[str, Any] | None = None) -> int:
+    total_mb = _guardian_total_mb(status)
+    if total_mb <= 0:
+        return 0
+
+    if kind == "heavy":
+        fraction = AUTO_HEAVY_FREE_FRACTION
+        cap_mb = AUTO_HEAVY_FREE_CAP_MB
+    else:
+        fraction = AUTO_BASE_FREE_FRACTION
+        cap_mb = AUTO_BASE_FREE_CAP_MB
+
+    target = max(0.0, total_mb * max(0.0, fraction))
+    if cap_mb > 0:
+        target = min(target, float(cap_mb))
+    if AUTO_FREE_RESERVE_MB > 0:
+        target = min(target, max(0.0, total_mb - AUTO_FREE_RESERVE_MB))
+    return _rounded_target_mb(target)
+
+
+def _base_free_target_mb(status: dict[str, Any] | None = None) -> int:
+    if BASE_FREE_MB_SET:
+        return max(0, BASE_FREE_MB)
+    if SCHEDULER_AUTO_PRESET:
+        return _auto_free_target_mb("base", status)
+    return max(0, BASE_FREE_MB)
+
+
+def _heavy_free_target_mb(status: dict[str, Any] | None = None) -> int:
+    if HEAVY_FREE_MB_SET:
+        return max(0, HEAVY_FREE_MB)
+    if SCHEDULER_AUTO_PRESET:
+        return _auto_free_target_mb("heavy", status)
+    return max(0, HEAVY_FREE_MB)
 
 
 def _ensure_guardian_free(free_mb: int) -> dict[str, Any] | None:
@@ -239,7 +369,14 @@ def _is_active_watermark_node(args: tuple[Any, ...], kwargs: dict[str, Any]) -> 
 
 def _is_active_watermark_prompt() -> bool:
     return _PROMPT_SCOPE_PATCHED and (
-        (SCHEDULER_ENABLE and BASE_FREE_MB > 0) or (ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in PROMPT_SCOPES)
+        (
+            SCHEDULER_ENABLE
+            and (
+                (BASE_FREE_MB_SET and BASE_FREE_MB > 0)
+                or (not BASE_FREE_MB_SET and SCHEDULER_AUTO_PRESET)
+            )
+        )
+        or (ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in PROMPT_SCOPES)
     )
 
 
@@ -363,18 +500,25 @@ def _record_oom_bump(
 ) -> None:
     if not PROFILE_ENABLE:
         return
-    run = SchedulerRun(label, class_name, node_id, max(target_free_mb, BASE_FREE_MB, ACTIVE_FREE_MB), input_signature)
+    run = SchedulerRun(label, class_name, node_id, max(target_free_mb, _base_free_target_mb(), ACTIVE_FREE_MB), input_signature)
     run.start(_guardian_status())
     run.stop()
     _record_profile(run, oom=True, success=False, bump=True)
 
 
 def _scheduler_prompt_target_mb() -> int:
-    if SCHEDULER_ENABLE and BASE_FREE_MB > 0:
-        return BASE_FREE_MB
+    if SCHEDULER_ENABLE:
+        target = _base_free_target_mb()
+        if target > 0:
+            return target
     if ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in PROMPT_SCOPES:
         return ACTIVE_FREE_MB
     return 0
+
+
+def _matches_heavy_pattern(class_name: str) -> bool:
+    normalized = class_name.lower()
+    return any(pattern and pattern in normalized for pattern in HEAVY_PATTERNS)
 
 
 def _scheduler_node_target_mb(class_name: str) -> tuple[int, str]:
@@ -388,11 +532,14 @@ def _scheduler_node_target_mb(class_name: str) -> tuple[int, str]:
     if class_name in NODE_FREE_MAP:
         target = NODE_FREE_MAP[class_name]
         source = "node-map"
-    elif class_name in HEAVY_NODES and HEAVY_FREE_MB > 0:
-        target = HEAVY_FREE_MB
+    elif class_name in HEAVY_NODES:
+        target = _heavy_free_target_mb()
         source = "heavy"
-    elif _PROMPT_WATERMARK_TOKEN is None and BASE_FREE_MB > 0:
-        target = BASE_FREE_MB
+    elif _matches_heavy_pattern(class_name):
+        target = _heavy_free_target_mb()
+        source = "heavy-pattern"
+    elif _PROMPT_WATERMARK_TOKEN is None and _base_free_target_mb() > 0:
+        target = _base_free_target_mb()
         source = "base"
 
     profile_target = _profile_target_mb(class_name)
@@ -908,6 +1055,17 @@ def _install() -> None:
         _install_get_output_data_patch()
         _install_async_result_patch()
         status = _guardian_request("status")
+        LOG.info(
+            "VRAM Guardian scheduler config: enabled=%s preset=%s base_free=%sMiB heavy_free=%sMiB "
+            "profile=%s heavy_patterns=%s node_map=%s",
+            SCHEDULER_ENABLE,
+            SCHEDULER_PRESET,
+            _base_free_target_mb(status),
+            _heavy_free_target_mb(status),
+            PROFILE_ENABLE,
+            ",".join(sorted(HEAVY_PATTERNS)) or "-",
+            ",".join(sorted(NODE_FREE_MAP)) or "-",
+        )
         LOG.info("VRAM Guardian plugin loaded; guardian status: %s", status)
     except Exception:
         LOG.exception("failed to install VRAM Guardian plugin")
