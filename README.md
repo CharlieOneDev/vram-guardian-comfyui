@@ -169,24 +169,26 @@ python main.py
 Default `heavy-video` behavior:
 
 - Scheduler mode is enabled by default.
-- Base workflow free target is automatic: `min(total_vram * 0.62, 28672 MiB)`.
+- Base workflow free target is automatic and intentionally low: `min(total_vram * 0.14, 6144 MiB)`.
 - Heavy node free target is automatic: `min(total_vram * 0.72, 32768 MiB)`.
 - Local profiling is enabled by default and writes `vram_guardian_profile.json`.
-- Heavy nodes are detected by broad class-name patterns such as `sampler`, `wan`, `ltx`, `bernini`, `video`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, and `model`.
+- Heavy nodes are detected by broad class-name patterns such as `sampler`, `wan`, `ltx`, `bernini`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, and `model`.
 
 For a 48 GiB/L40-class GPU this means roughly:
 
 ```text
-base free target:  about 28 GiB
+base free target:  about 6 GiB
 heavy free target: about 32 GiB
 ```
+
+This keeps free VRAM exposure low while the workflow is idle or running light nodes. Guardian releases a large burst window only immediately before a heavy node starts.
 
 Manual overrides are still available:
 
 ```bash
 export VRAM_GUARDIAN_BASE_FREE_MB=32768
 export VRAM_GUARDIAN_HEAVY_FREE_MB=36864
-export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,video,vsr,upscale,interpol,decode,vae,pose,model
+export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,vsr,upscale,interpol,decode,vae,pose,model
 python main.py
 ```
 
@@ -219,11 +221,11 @@ ComfyUI plugin:
 
 - `VRAM_GUARDIAN_SCHEDULER_PRESET`: preset name. Default: `heavy-video`. Use `manual` or `off` to disable automatic heavy-video defaults.
 - `VRAM_GUARDIAN_SCHEDULER_ENABLE`: enable Scheduler mode. Default: `true` under the `heavy-video` preset.
-- `VRAM_GUARDIAN_BASE_FREE_MB`: explicit base free-VRAM target. If unset, `heavy-video` uses `min(total_vram * 0.62, 28672 MiB)`.
+- `VRAM_GUARDIAN_BASE_FREE_MB`: explicit base free-VRAM target. If unset, `heavy-video` uses `min(total_vram * 0.14, 6144 MiB)`.
 - `VRAM_GUARDIAN_HEAVY_FREE_MB`: explicit heavy-node target. If unset, `heavy-video` uses `min(total_vram * 0.72, 32768 MiB)`.
-- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: automatic base target fraction. Default: `0.62`.
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: automatic base target fraction. Default: `0.14`.
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: automatic heavy target fraction. Default: `0.72`.
-- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base target cap. Default: `28672`.
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base target cap. Default: `6144`.
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: automatic heavy target cap. Default: `32768`.
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: JSON object mapping node class names to target free MiB.
 - `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated heavy node class names using `HEAVY_FREE_MB`.
@@ -252,14 +254,14 @@ Legacy plugin controls remain available:
 Guardian logs include compact VRAM summaries:
 
 ```text
-total=45458MiB free=28672MiB guardian_held=9216MiB target=37275MiB external_calc=7570MiB guardian_proc=9472MiB comfyui=4096MiB other=3474MiB paused=0s
+total=45458MiB free=6144MiB guardian_held=33200MiB target=37275MiB external_calc=6114MiB guardian_proc=33200MiB comfyui=4096MiB other=2018MiB paused=0s
 ```
 
 Scheduler logs use the `[VRAM Scheduler]` prefix:
 
 ```text
 [VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
-[VRAM Scheduler] WanVideoSampler#12 waiting: free=28672MiB target=32768MiB guardian_held=4096MiB
+[VRAM Scheduler] WanVideoSampler#12 waiting: free=6144MiB target=32768MiB guardian_held=26624MiB
 [VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
 

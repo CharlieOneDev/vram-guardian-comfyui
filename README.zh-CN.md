@@ -159,24 +159,26 @@ python main.py
 默认 `heavy-video` 行为：
 
 - Scheduler 默认启用。
-- 基础 workflow 空闲显存目标自动计算：`min(total_vram * 0.62, 28672 MiB)`。
+- 基础 workflow 空闲显存目标会自动计算，并刻意保持低暴露：`min(total_vram * 0.14, 6144 MiB)`。
 - 重节点空闲显存目标自动计算：`min(total_vram * 0.72, 32768 MiB)`。
 - 本地 profiling 默认启用，写入 `vram_guardian_profile.json`。
-- 重节点通过宽泛 class-name 模糊匹配识别，例如 `sampler`、`wan`、`ltx`、`bernini`、`video`、`vsr`、`upscale`、`interpol`、`decode`、`vae`、`pose`、`model`。
+- 重节点通过宽泛 class-name 模糊匹配识别，例如 `sampler`、`wan`、`ltx`、`bernini`、`vsr`、`upscale`、`interpol`、`decode`、`vae`、`pose`、`model`。
 
 在 48 GiB/L40 级别 GPU 上，大致相当于：
 
 ```text
-base free target:  约 28 GiB
+base free target:  约 6 GiB
 heavy free target: 约 32 GiB
 ```
+
+这样在 workflow 空转、等待或执行轻节点时，暴露在 free 状态的显存会尽量少。只有重节点即将开始时，Guardian 才会快速释放出大块 burst window。
 
 仍然可以手动覆盖：
 
 ```bash
 export VRAM_GUARDIAN_BASE_FREE_MB=32768
 export VRAM_GUARDIAN_HEAVY_FREE_MB=36864
-export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,video,vsr,upscale,interpol,decode,vae,pose,model
+export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,vsr,upscale,interpol,decode,vae,pose,model
 python main.py
 ```
 
@@ -223,11 +225,11 @@ ComfyUI 插件：
 
 - `VRAM_GUARDIAN_SCHEDULER_PRESET`: scheduler preset，默认 `heavy-video`。设置为 `manual` 或 `off` 可关闭自动 heavy-video 默认值。
 - `VRAM_GUARDIAN_SCHEDULER_ENABLE`: 启用 Scheduler，`heavy-video` 下默认启用。
-- `VRAM_GUARDIAN_BASE_FREE_MB`: 显式基础空闲显存目标。未设置时，`heavy-video` 使用 `min(total_vram * 0.62, 28672 MiB)`。
+- `VRAM_GUARDIAN_BASE_FREE_MB`: 显式基础空闲显存目标。未设置时，`heavy-video` 使用 `min(total_vram * 0.14, 6144 MiB)`。
 - `VRAM_GUARDIAN_HEAVY_FREE_MB`: 显式重节点空闲显存目标。未设置时，`heavy-video` 使用 `min(total_vram * 0.72, 32768 MiB)`。
-- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: 自动基础目标比例，默认 `0.62`。
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: 自动基础目标比例，默认 `0.14`。
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: 自动重节点目标比例，默认 `0.72`。
-- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: 自动基础目标上限，默认 `28672`。
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: 自动基础目标上限，默认 `6144`。
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: 自动重节点目标上限，默认 `32768`。
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: 节点 class 到目标 free 的 JSON 映射。
 - `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class。
@@ -248,14 +250,14 @@ ComfyUI 插件：
 Guardian 日志会显示总显存、空闲显存、Guardian 占用、ComfyUI 占用和其他进程占用：
 
 ```text
-total=45458MiB free=28672MiB guardian_held=9216MiB target=37275MiB external_calc=7570MiB guardian_proc=9472MiB comfyui=4096MiB other=3474MiB paused=0s
+total=45458MiB free=6144MiB guardian_held=33200MiB target=37275MiB external_calc=6114MiB guardian_proc=33200MiB comfyui=4096MiB other=2018MiB paused=0s
 ```
 
 Scheduler 日志示例：
 
 ```text
 [VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
-[VRAM Scheduler] WanVideoSampler#12 waiting: free=28672MiB target=32768MiB guardian_held=4096MiB
+[VRAM Scheduler] WanVideoSampler#12 waiting: free=6144MiB target=32768MiB guardian_held=26624MiB
 [VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
 

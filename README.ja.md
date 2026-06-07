@@ -124,24 +124,26 @@ python main.py
 Default `heavy-video` behavior:
 
 - Scheduler mode はデフォルトで有効。
-- base workflow target は自動計算: `min(total_vram * 0.62, 28672 MiB)`。
+- base workflow target は低い free exposure を保つため自動計算: `min(total_vram * 0.14, 6144 MiB)`。
 - heavy node target は自動計算: `min(total_vram * 0.72, 32768 MiB)`。
 - local profiling はデフォルトで有効で、`vram_guardian_profile.json` に書き込みます。
-- heavy node は `sampler`, `wan`, `ltx`, `bernini`, `video`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, `model` などの class-name pattern で検出されます。
+- heavy node は `sampler`, `wan`, `ltx`, `bernini`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, `model` などの class-name pattern で検出されます。
 
 48 GiB/L40 class GPU ではおおよそ:
 
 ```text
-base free target:  about 28 GiB
+base free target:  about 6 GiB
 heavy free target: about 32 GiB
 ```
+
+これにより workflow が idle、waiting、light node 実行中の free VRAM exposure は低く保たれます。heavy node 開始直前だけ、Guardian が大きな burst window を release します。
 
 Manual override:
 
 ```bash
 export VRAM_GUARDIAN_BASE_FREE_MB=32768
 export VRAM_GUARDIAN_HEAVY_FREE_MB=36864
-export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,video,vsr,upscale,interpol,decode,vae,pose,model
+export VRAM_GUARDIAN_HEAVY_PATTERNS=sampler,wan,ltx,bernini,vsr,upscale,interpol,decode,vae,pose,model
 python main.py
 ```
 
@@ -177,11 +179,11 @@ ComfyUI plugin:
 
 - `VRAM_GUARDIAN_SCHEDULER_PRESET`: scheduler preset。デフォルト `heavy-video`。`manual` または `off` で automatic heavy-video defaults を無効化。
 - `VRAM_GUARDIAN_SCHEDULER_ENABLE`: Scheduler を有効化。`heavy-video` ではデフォルト有効。
-- `VRAM_GUARDIAN_BASE_FREE_MB`: explicit base target。未設定時、`heavy-video` は `min(total_vram * 0.62, 28672 MiB)` を使用。
+- `VRAM_GUARDIAN_BASE_FREE_MB`: explicit base target。未設定時、`heavy-video` は `min(total_vram * 0.14, 6144 MiB)` を使用。
 - `VRAM_GUARDIAN_HEAVY_FREE_MB`: explicit heavy target。未設定時、`heavy-video` は `min(total_vram * 0.72, 32768 MiB)` を使用。
-- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: automatic base fraction。デフォルト `0.62`。
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_FRACTION`: automatic base fraction。デフォルト `0.14`。
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: automatic heavy fraction。デフォルト `0.72`。
-- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base cap。デフォルト `28672`。
+- `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base cap。デフォルト `6144`。
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: automatic heavy cap。デフォルト `32768`。
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: node class と target free MiB の JSON map。
 - `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated heavy node class names。
@@ -198,14 +200,14 @@ ComfyUI plugin:
 Guardian summary:
 
 ```text
-total=45458MiB free=28672MiB guardian_held=9216MiB target=37275MiB external_calc=7570MiB guardian_proc=9472MiB comfyui=4096MiB other=3474MiB paused=0s
+total=45458MiB free=6144MiB guardian_held=33200MiB target=37275MiB external_calc=6114MiB guardian_proc=33200MiB comfyui=4096MiB other=2018MiB paused=0s
 ```
 
 Scheduler:
 
 ```text
 [VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
-[VRAM Scheduler] WanVideoSampler#12 waiting: free=28672MiB target=32768MiB guardian_held=4096MiB
+[VRAM Scheduler] WanVideoSampler#12 waiting: free=6144MiB target=32768MiB guardian_held=26624MiB
 [VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
 
