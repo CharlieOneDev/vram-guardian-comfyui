@@ -130,10 +130,12 @@ Useful environment variables:
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin releases Guardian before each node. Default: `false`.
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: pause auto-refill after release so ComfyUI can allocate. Default: `3600`.
 - `VRAM_GUARDIAN_COMFYUI_PID`: optional PID used to classify ComfyUI VRAM in Guardian logs when auto-detection is not enough.
-- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: ComfyUI plugin enables Guardian watermark mode during matching nodes and keeps this much VRAM free. Default: `0` disabled.
+- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: ComfyUI plugin enables Guardian watermark mode during the active scope and keeps this much VRAM free. Default: `0` disabled.
 - `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: free-VRAM band before Guardian fills surplus again. Default: `2048`.
-- `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated node class names that should use active watermark mode. Empty means all nodes when `ACTIVE_FREE_MB` is set.
+- `VRAM_GUARDIAN_ACTIVE_SCOPE`: active watermark scope. Use `prompt` for the whole ComfyUI workflow, or `node` for selected nodes. Default: `prompt`.
+- `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated node class names used only when `ACTIVE_SCOPE=node`. Empty means all nodes in node scope.
 - `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: Guardian check interval while watermark mode is active. Default: `1`.
+- `VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC`: short delay before Guardian refills after a watermark release. Default: `5`.
 
 ## Install the ComfyUI plugin
 
@@ -171,12 +173,12 @@ VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
 
-For long-running heavy nodes, prefer active watermark mode. Guardian keeps a target amount of free VRAM available while still holding the surplus as a reservation:
+For general ComfyUI workflows, prefer prompt-scope active watermark mode. Guardian keeps a target amount of free VRAM available for the whole workflow while still holding the surplus as a reservation:
 
 ```bash
 VRAM_GUARDIAN_HOST=127.0.0.1 \
 VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner \
+VRAM_GUARDIAN_ACTIVE_SCOPE=prompt \
 VRAM_GUARDIAN_ACTIVE_FREE_MB=20480 \
 VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=2048 \
 VRAM_GUARDIAN_RELEASE_BEFORE_NODE=0 \
@@ -184,7 +186,11 @@ VRAM_GUARDIAN_RECLAIM_ON_SUCCESS=1 \
 python main.py
 ```
 
-In this mode, Guardian dynamically releases chunks if free VRAM drops below `ACTIVE_FREE_MB`, and fills again only when free VRAM rises above `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB`.
+In this mode, the plugin opens a token-scoped watermark session for the active scope. Guardian releases chunks if free VRAM drops below `ACTIVE_FREE_MB`, waits through a short cooldown, and fills surplus only while preserving `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB` free VRAM. If a node OOMs and retries, the retry runs after a full Guardian release without re-enabling watermark refill.
+
+Choose `ACTIVE_FREE_MB` as the largest sudden allocation headroom the workflow or node may need. A background watcher cannot prevent OOM for one single allocation that is larger than currently free VRAM.
+
+For node-only tuning, set `VRAM_GUARDIAN_ACTIVE_SCOPE=node` and optionally `VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner`.
 
 If ComfyUI runs in another Docker container on the same compose network, set:
 

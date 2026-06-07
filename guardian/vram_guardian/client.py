@@ -31,6 +31,7 @@ def main() -> int:
     parser.add_argument("--mode", default=None, help="set_watermark mode: true/false")
     parser.add_argument("--free-mb", default=None, type=int, help="set_watermark target free VRAM")
     parser.add_argument("--hysteresis-mb", default=None, type=int, help="set_watermark hysteresis")
+    parser.add_argument("--token", default=None, help="set_watermark session token")
     parser.add_argument("--timeout", default=3.0, type=float)
     args = parser.parse_args()
 
@@ -46,6 +47,8 @@ def main() -> int:
             payload["free_mb"] = args.free_mb
         if args.hysteresis_mb is not None:
             payload["hysteresis_mb"] = args.hysteresis_mb
+        if args.token is not None:
+            payload["token"] = args.token
 
     print(json.dumps(request(args.host, args.port, payload, args.timeout), indent=2))
     return 0

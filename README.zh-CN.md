@@ -134,10 +134,12 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI 插件在每个节点执行前先释放 Guardian。默认：`false`。
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 后暂停 auto-refill，给 ComfyUI 留出分配时间。默认：`3600`。
 - `VRAM_GUARDIAN_COMFYUI_PID`: 可选，用于自动识别不准时，指定 ComfyUI PID 以便日志区分 ComfyUI 显存。
-- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: 插件在匹配节点运行期间开启 Guardian watermark 模式，并维持这么多空闲显存。默认：`0`，表示关闭。
+- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: 插件在当前作用范围运行期间开启 Guardian watermark 模式，并维持这么多空闲显存。默认：`0`，表示关闭。
 - `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: 空闲显存超过目标多少后，Guardian 才补占多余部分。默认：`2048`。
-- `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class 名称。为空时，只要设置了 `ACTIVE_FREE_MB` 就对所有节点生效。
+- `VRAM_GUARDIAN_ACTIVE_SCOPE`: active watermark 的作用范围。`prompt` 表示整个 ComfyUI 工作流，`node` 表示指定节点。默认：`prompt`。
+- `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class 名称，只在 `ACTIVE_SCOPE=node` 时使用。为空时，node scope 下对所有节点生效。
 - `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: Guardian 在 watermark 模式下的检查间隔。默认：`1`。
+- `VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC`: watermark 释放后，Guardian 等多久再考虑补占。默认：`5`。
 
 ## 安装 ComfyUI 插件
 
@@ -175,12 +177,12 @@ VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
 
-对于长时间运行的重节点，更推荐 active watermark 模式。Guardian 会在节点执行期间维持一段目标空闲显存，同时继续占住多余显存作为防抢占保护：
+对于通用 ComfyUI 工作流，更推荐 prompt-scope active watermark 模式。Guardian 会在整个工作流执行期间维持一段目标空闲显存，同时继续占住多余显存作为防抢占保护：
 
 ```bash
 VRAM_GUARDIAN_HOST=127.0.0.1 \
 VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner \
+VRAM_GUARDIAN_ACTIVE_SCOPE=prompt \
 VRAM_GUARDIAN_ACTIVE_FREE_MB=20480 \
 VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=2048 \
 VRAM_GUARDIAN_RELEASE_BEFORE_NODE=0 \
@@ -188,7 +190,11 @@ VRAM_GUARDIAN_RECLAIM_ON_SUCCESS=1 \
 python main.py
 ```
 
-这个模式下，如果空闲显存低于 `ACTIVE_FREE_MB`，Guardian 会动态释放 chunk；如果空闲显存高于 `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB`，Guardian 才会补占多余部分。
+这个模式下，插件会为当前作用范围开启带 token 的 watermark 会话。空闲显存低于 `ACTIVE_FREE_MB` 时，Guardian 会动态释放 chunk；释放后会等待一个短冷却；只有空闲显存高于 `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB` 时，Guardian 才会在保留这段空闲显存的前提下补占多余部分。如果节点 OOM 后重试，重试会使用全释放状态，不会重新开启 watermark 补占。
+
+`ACTIVE_FREE_MB` 要按这个工作流或节点可能出现的最大瞬时显存申请来设。后台监控不能阻止“单次申请量大于当前空闲显存”的 OOM，所以长视频场景不要把这个值设得太低。
+
+如果只想针对某些节点微调，可以设置 `VRAM_GUARDIAN_ACTIVE_SCOPE=node`，再按需设置 `VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner`。
 
 如果 ComfyUI 运行在同一个 compose 网络里的另一个 Docker 容器中，设置：
 

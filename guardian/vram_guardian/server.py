@@ -113,6 +113,7 @@ class GuardianConfig:
     watermark_free_mb: int = 0
     watermark_hysteresis_mb: int = 2048
     watermark_interval_sec: float = 1.0
+    watermark_release_cooldown_sec: float = 5.0
 
     @property
     def min_free_bytes(self) -> int:
@@ -143,8 +144,14 @@ class VramGuardian:
         self.lock = threading.RLock()
         self.chunks: list[torch.Tensor] = []
         self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
         self.auto_refill_thread: threading.Thread | None = None
         self.auto_refill_paused_until = 0.0
+        self.manual_watermark_mode = config.watermark_mode
+        self.manual_watermark_free_mb = config.watermark_free_mb
+        self.manual_watermark_hysteresis_mb = config.watermark_hysteresis_mb
+        self.watermark_sessions: dict[str, tuple[int, int]] = {}
+        self.watermark_cooldown_until = 0.0
 
     def held_bytes_unlocked(self) -> int:
         return sum(chunk.numel() * chunk.element_size() for chunk in self.chunks)
@@ -228,6 +235,8 @@ class VramGuardian:
         with self.lock:
             if self.config.watermark_mode:
                 return self.apply_watermark_unlocked()
+            if not self.config.auto_refill:
+                return self.status_unlocked(extra={"allocated_bytes": 0, "auto_refill_skipped": "disabled"})
             paused_for = self.auto_refill_paused_until - time.monotonic()
             if paused_for > 0:
                 return self.status_unlocked(
@@ -249,6 +258,9 @@ class VramGuardian:
             if pause_refill_sec > 0:
                 self.auto_refill_paused_until = max(self.auto_refill_paused_until, time.monotonic() + pause_refill_sec)
             released = self.release_bytes_unlocked(bytes_to_release)
+            if released > 0 and self.config.watermark_mode:
+                self.watermark_cooldown_until = time.monotonic() + max(0.0, self.config.watermark_release_cooldown_sec)
+            self.wake_event.set()
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -266,22 +278,52 @@ class VramGuardian:
             )
             return status
 
-    def set_watermark(self, mode: bool, free_mb: int | None = None, hysteresis_mb: int | None = None) -> dict[str, Any]:
+    def set_watermark(
+        self,
+        mode: bool,
+        free_mb: int | None = None,
+        hysteresis_mb: int | None = None,
+        token: str | None = None,
+    ) -> dict[str, Any]:
         with self.lock:
-            self.config.watermark_mode = mode
-            if free_mb is not None:
-                self.config.watermark_free_mb = max(0, free_mb)
-            if hysteresis_mb is not None:
-                self.config.watermark_hysteresis_mb = max(16, hysteresis_mb)
-            status = self.apply_watermark_unlocked() if mode else self.status_unlocked()
+            if token:
+                if mode:
+                    session_free_mb = max(0, free_mb if free_mb is not None else self.config.watermark_free_mb)
+                    session_hysteresis_mb = max(16, hysteresis_mb if hysteresis_mb is not None else self.config.watermark_hysteresis_mb)
+                    self.watermark_sessions[token] = (session_free_mb, session_hysteresis_mb)
+                else:
+                    self.watermark_sessions.pop(token, None)
+            else:
+                self.manual_watermark_mode = mode
+                if free_mb is not None:
+                    self.manual_watermark_free_mb = max(0, free_mb)
+                if hysteresis_mb is not None:
+                    self.manual_watermark_hysteresis_mb = max(16, hysteresis_mb)
+
+            self.refresh_watermark_config_unlocked()
+            self.wake_event.set()
+            status = self.apply_watermark_unlocked() if self.config.watermark_mode else self.status_unlocked()
             LOG.info(
-                "watermark mode=%s free_target=%sMiB hysteresis=%sMiB | %s",
+                "watermark mode=%s free_target=%sMiB hysteresis=%sMiB sessions=%s token=%s | %s",
                 self.config.watermark_mode,
                 self.config.watermark_free_mb,
                 self.config.watermark_hysteresis_mb,
+                len(self.watermark_sessions),
+                token or "manual",
                 self.format_memory_summary(status),
             )
             return status
+
+    def refresh_watermark_config_unlocked(self) -> None:
+        if self.watermark_sessions:
+            self.config.watermark_mode = True
+            self.config.watermark_free_mb = max(free_mb for free_mb, _ in self.watermark_sessions.values())
+            self.config.watermark_hysteresis_mb = max(hysteresis_mb for _, hysteresis_mb in self.watermark_sessions.values())
+            return
+
+        self.config.watermark_mode = self.manual_watermark_mode
+        self.config.watermark_free_mb = self.manual_watermark_free_mb
+        self.config.watermark_hysteresis_mb = self.manual_watermark_hysteresis_mb
 
     def apply_watermark_unlocked(self) -> dict[str, Any]:
         if not self.config.watermark_mode or self.config.watermark_free_mb <= 0:
@@ -296,6 +338,8 @@ class VramGuardian:
         if free_mb < target_mb:
             need_bytes = int((target_mb - free_mb) * MIB)
             released = self.release_bytes_unlocked(need_bytes)
+            if released > 0:
+                self.watermark_cooldown_until = time.monotonic() + max(0.0, self.config.watermark_release_cooldown_sec)
             gc.collect()
             torch.cuda.empty_cache()
             try:
@@ -308,7 +352,19 @@ class VramGuardian:
             return status
 
         if free_mb > target_mb + hysteresis_mb:
-            allocated = self.fill_preserving_free_unlocked(self.config.watermark_free_mb * MIB)
+            cooldown_remaining = self.watermark_cooldown_until - time.monotonic()
+            if cooldown_remaining > 0:
+                return self.status_unlocked(
+                    extra={
+                        "allocated_bytes": 0,
+                        "released_bytes": 0,
+                        "watermark_action": "cooldown",
+                        "watermark_cooldown_sec": round(cooldown_remaining, 2),
+                    }
+                )
+
+            preserve_free_bytes = int((target_mb + hysteresis_mb) * MIB)
+            allocated = self.fill_preserving_free_unlocked(preserve_free_bytes)
             status = self.status_unlocked(extra={"allocated_bytes": allocated})
             status["watermark_action"] = "fill"
             if allocated > 0:
@@ -318,18 +374,21 @@ class VramGuardian:
         return self.status_unlocked(extra={"allocated_bytes": 0, "released_bytes": 0, "watermark_action": "hold"})
 
     def start_auto_refill(self) -> None:
-        if not self.config.auto_refill or self.auto_refill_thread is not None:
+        if self.auto_refill_thread is not None:
             return
         self.auto_refill_thread = threading.Thread(target=self._auto_refill_loop, name="vram-auto-refill", daemon=True)
         self.auto_refill_thread.start()
         LOG.info(
-            "auto refill enabled: interval=%ss min_delta=%s MiB",
+            "control loop enabled: auto_refill=%s interval=%ss min_delta=%s MiB watermark_interval=%ss",
+            self.config.auto_refill,
             self.config.auto_refill_interval_sec,
             self.config.auto_refill_min_delta_mb,
+            self.config.watermark_interval_sec,
         )
 
     def stop_auto_refill(self) -> None:
         self.stop_event.set()
+        self.wake_event.set()
         if self.auto_refill_thread is not None:
             timeout = max(1.0, self.config.auto_refill_interval_sec, self.config.watermark_interval_sec)
             self.auto_refill_thread.join(timeout=timeout)
@@ -337,19 +396,26 @@ class VramGuardian:
     def _auto_refill_loop(self) -> None:
         while True:
             interval = self.config.watermark_interval_sec if self.config.watermark_mode else self.config.auto_refill_interval_sec
-            if self.stop_event.wait(max(0.2, interval)):
+            self.wake_event.wait(max(0.2, interval))
+            self.wake_event.clear()
+            if self.stop_event.is_set():
                 break
             try:
+                if not self.config.watermark_mode and not self.config.auto_refill:
+                    continue
                 status = self.maybe_refill()
                 allocated = int(status.get("allocated_bytes", 0) or 0)
                 if allocated > 0:
-                    LOG.info("auto refill allocated %.2f MiB | %s", allocated / MIB, self.format_memory_summary(status))
+                    action = status.get("watermark_action")
+                    prefix = "watermark" if action else "auto refill"
+                    LOG.info("%s allocated %.2f MiB | %s", prefix, allocated / MIB, self.format_memory_summary(status))
             except Exception:
-                LOG.exception("auto refill failed")
+                LOG.exception("control loop failed")
 
     def set_fraction(self, fraction: float) -> dict[str, Any]:
         with self.lock:
             self.config.fraction = max(0.0, min(0.98, fraction))
+            self.wake_event.set()
             return self.fill()
 
     def status_unlocked(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -373,6 +439,8 @@ class VramGuardian:
             "watermark_free_mb": self.config.watermark_free_mb,
             "watermark_hysteresis_mb": self.config.watermark_hysteresis_mb,
             "watermark_interval_sec": self.config.watermark_interval_sec,
+            "watermark_release_cooldown_sec": self.config.watermark_release_cooldown_sec,
+            "watermark_session_count": len(self.watermark_sessions),
             "chunks": len(self.chunks),
             "held_bytes": held,
             "held_mb": round(held / MIB, 2),
@@ -491,10 +559,12 @@ class GuardianTCPServer(socketserver.ThreadingTCPServer):
                 mode = mode.strip().lower() not in {"0", "false", "no", "off"}
             free_mb = request.get("free_mb")
             hysteresis_mb = request.get("hysteresis_mb")
+            token = request.get("token")
             return self.guardian.set_watermark(
                 bool(mode),
                 None if free_mb is None else int(free_mb),
                 None if hysteresis_mb is None else int(hysteresis_mb),
+                None if token is None else str(token),
             )
         if cmd == "set_fraction":
             return self.guardian.set_fraction(float(request["fraction"]))
@@ -557,6 +627,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_float("VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC", 1.0),
         type=float,
     )
+    parser.add_argument(
+        "--watermark-release-cooldown-sec",
+        default=env_float("VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC", 5.0),
+        type=float,
+    )
     parser.add_argument("--log-level", default=os.getenv("VRAM_GUARDIAN_LOG_LEVEL", "INFO"))
     return parser
 
@@ -585,6 +660,7 @@ def main() -> int:
             watermark_free_mb=args.watermark_free_mb,
             watermark_hysteresis_mb=args.watermark_hysteresis_mb,
             watermark_interval_sec=args.watermark_interval_sec,
+            watermark_release_cooldown_sec=args.watermark_release_cooldown_sec,
         )
     )
     initial_status = guardian.fill()
