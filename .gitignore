@@ -9,6 +9,7 @@ __pycache__/
 venv/
 
 *.log
+*.pid
 .env
 .env.*
 

@@ -87,7 +87,22 @@ docker run -d \
   vram-guardian-comfyui:local
 ```
 
-Check status:
+If direct Docker also fails during NVIDIA runtime initialization with an error like `/proc/driver/nvidia/gpus/... no such file or directory`, run Guardian directly in the current Linux/CNB/WSL environment instead of nesting another GPU container:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
+```
+
+Direct mode writes logs to `vram_guardian.log` and a PID file to `vram_guardian.pid`.
+
+```bash
+bash scripts/guardian_direct.sh status
+bash scripts/guardian_direct.sh logs
+bash scripts/guardian_direct.sh stop
+```
+
+For Docker or Compose mode, check status with:
 
 ```bash
 docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1 --port 8765

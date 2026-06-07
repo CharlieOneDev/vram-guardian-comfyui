@@ -91,7 +91,22 @@ docker run -d \
   vram-guardian-comfyui:local
 ```
 
-查看状态：
+如果直接 Docker 启动也在 NVIDIA runtime 初始化阶段失败，并出现类似 `/proc/driver/nvidia/gpus/... no such file or directory`，说明当前 CNB/嵌套 Docker 环境不适合再套一层 GPU 容器。这时改用 direct 模式：直接在当前 Linux/CNB/WSL 环境里跑 Guardian 进程。
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
+```
+
+direct 模式会把日志写到 `vram_guardian.log`，PID 写到 `vram_guardian.pid`。
+
+```bash
+bash scripts/guardian_direct.sh status
+bash scripts/guardian_direct.sh logs
+bash scripts/guardian_direct.sh stop
+```
+
+Docker 或 Compose 模式用下面的命令查看状态：
 
 ```bash
 docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1 --port 8765
