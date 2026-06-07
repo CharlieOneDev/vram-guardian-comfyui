@@ -109,6 +109,10 @@ class GuardianConfig:
     auto_refill: bool = True
     auto_refill_interval_sec: float = 5.0
     auto_refill_min_delta_mb: int = 256
+    watermark_mode: bool = False
+    watermark_free_mb: int = 0
+    watermark_hysteresis_mb: int = 2048
+    watermark_interval_sec: float = 1.0
 
     @property
     def min_free_bytes(self) -> int:
@@ -161,42 +165,58 @@ class VramGuardian:
         with self.lock:
             if clear_pause:
                 self.auto_refill_paused_until = 0.0
-            allocated = 0
-            attempts = 0
-            while True:
-                held = self.held_bytes_unlocked()
-                free, _ = self.mem_info_unlocked()
-                target = self.target_bytes_unlocked()
-                remaining_to_target = target - held
-                available_to_take = free - self.config.min_free_bytes
-
-                if remaining_to_target <= 0 or available_to_take < 16 * MIB:
-                    break
-
-                size = min(self.config.chunk_bytes, remaining_to_target, available_to_take)
-                size = int(size // MIB) * MIB
-                if size < 16 * MIB:
-                    break
-
-                chunk = None
-                try:
-                    chunk = torch.empty(size, dtype=torch.uint8, device=self.device)
-                    chunk.zero_()
-                    torch.cuda.synchronize(self.device)
-                    self.chunks.append(chunk)
-                    allocated += size
-                    attempts = 0
-                except torch.cuda.OutOfMemoryError:
-                    if chunk is not None:
-                        del chunk
-                    attempts += 1
-                    torch.cuda.empty_cache()
-                    if attempts >= 3 or size <= 16 * MIB:
-                        break
-                    self.config.chunk_mb = max(16, self.config.chunk_mb // 2)
-                    LOG.warning("OOM while filling; reducing chunk size to %s MiB", self.config.chunk_mb)
+            allocated = self.fill_preserving_free_unlocked(self.config.min_free_bytes)
 
             return self.status_unlocked(extra={"allocated_bytes": allocated})
+
+    def fill_preserving_free_unlocked(self, min_free_bytes: int) -> int:
+        allocated = 0
+        attempts = 0
+        while True:
+            held = self.held_bytes_unlocked()
+            free, _ = self.mem_info_unlocked()
+            target = self.target_bytes_unlocked()
+            remaining_to_target = target - held
+            available_to_take = free - min_free_bytes
+
+            if remaining_to_target <= 0 or available_to_take < 16 * MIB:
+                break
+
+            size = min(self.config.chunk_bytes, remaining_to_target, available_to_take)
+            size = int(size // MIB) * MIB
+            if size < 16 * MIB:
+                break
+
+            chunk = None
+            try:
+                chunk = torch.empty(size, dtype=torch.uint8, device=self.device)
+                chunk.zero_()
+                torch.cuda.synchronize(self.device)
+                self.chunks.append(chunk)
+                allocated += size
+                attempts = 0
+            except torch.cuda.OutOfMemoryError:
+                if chunk is not None:
+                    del chunk
+                attempts += 1
+                torch.cuda.empty_cache()
+                if attempts >= 3 or size <= 16 * MIB:
+                    break
+                self.config.chunk_mb = max(16, self.config.chunk_mb // 2)
+                LOG.warning("OOM while filling; reducing chunk size to %s MiB", self.config.chunk_mb)
+        return allocated
+
+    def release_bytes_unlocked(self, bytes_to_release: int = 0) -> int:
+        released = 0
+        if bytes_to_release <= 0:
+            released = self.held_bytes_unlocked()
+            self.chunks.clear()
+        else:
+            while self.chunks and released < bytes_to_release:
+                chunk = self.chunks.pop()
+                released += chunk.numel() * chunk.element_size()
+                del chunk
+        return released
 
     def pause_auto_refill(self, seconds: float) -> None:
         if seconds <= 0:
@@ -206,6 +226,8 @@ class VramGuardian:
 
     def maybe_refill(self) -> dict[str, Any]:
         with self.lock:
+            if self.config.watermark_mode:
+                return self.apply_watermark_unlocked()
             paused_for = self.auto_refill_paused_until - time.monotonic()
             if paused_for > 0:
                 return self.status_unlocked(
@@ -226,15 +248,7 @@ class VramGuardian:
         with self.lock:
             if pause_refill_sec > 0:
                 self.auto_refill_paused_until = max(self.auto_refill_paused_until, time.monotonic() + pause_refill_sec)
-            released = 0
-            if bytes_to_release <= 0:
-                released = self.held_bytes_unlocked()
-                self.chunks.clear()
-            else:
-                while self.chunks and released < bytes_to_release:
-                    chunk = self.chunks.pop()
-                    released += chunk.numel() * chunk.element_size()
-                    del chunk
+            released = self.release_bytes_unlocked(bytes_to_release)
 
             gc.collect()
             torch.cuda.empty_cache()
@@ -252,6 +266,57 @@ class VramGuardian:
             )
             return status
 
+    def set_watermark(self, mode: bool, free_mb: int | None = None, hysteresis_mb: int | None = None) -> dict[str, Any]:
+        with self.lock:
+            self.config.watermark_mode = mode
+            if free_mb is not None:
+                self.config.watermark_free_mb = max(0, free_mb)
+            if hysteresis_mb is not None:
+                self.config.watermark_hysteresis_mb = max(16, hysteresis_mb)
+            status = self.apply_watermark_unlocked() if mode else self.status_unlocked()
+            LOG.info(
+                "watermark mode=%s free_target=%sMiB hysteresis=%sMiB | %s",
+                self.config.watermark_mode,
+                self.config.watermark_free_mb,
+                self.config.watermark_hysteresis_mb,
+                self.format_memory_summary(status),
+            )
+            return status
+
+    def apply_watermark_unlocked(self) -> dict[str, Any]:
+        if not self.config.watermark_mode or self.config.watermark_free_mb <= 0:
+            return self.status_unlocked(extra={"allocated_bytes": 0, "released_bytes": 0, "watermark_action": "disabled"})
+
+        free, _ = self.mem_info_unlocked()
+        free_mb = free / MIB
+        target_mb = self.config.watermark_free_mb
+        hysteresis_mb = self.config.watermark_hysteresis_mb
+        released = 0
+
+        if free_mb < target_mb:
+            need_bytes = int((target_mb - free_mb) * MIB)
+            released = self.release_bytes_unlocked(need_bytes)
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                LOG.debug("torch.cuda.ipc_collect failed", exc_info=True)
+            status = self.status_unlocked(extra={"released_bytes": released, "allocated_bytes": 0, "watermark_action": "release"})
+            if released > 0:
+                LOG.info("watermark released %.2f MiB | %s", released / MIB, self.format_memory_summary(status))
+            return status
+
+        if free_mb > target_mb + hysteresis_mb:
+            allocated = self.fill_preserving_free_unlocked(self.config.watermark_free_mb * MIB)
+            status = self.status_unlocked(extra={"allocated_bytes": allocated})
+            status["watermark_action"] = "fill"
+            if allocated > 0:
+                LOG.info("watermark filled %.2f MiB | %s", allocated / MIB, self.format_memory_summary(status))
+            return status
+
+        return self.status_unlocked(extra={"allocated_bytes": 0, "released_bytes": 0, "watermark_action": "hold"})
+
     def start_auto_refill(self) -> None:
         if not self.config.auto_refill or self.auto_refill_thread is not None:
             return
@@ -266,10 +331,14 @@ class VramGuardian:
     def stop_auto_refill(self) -> None:
         self.stop_event.set()
         if self.auto_refill_thread is not None:
-            self.auto_refill_thread.join(timeout=max(1.0, self.config.auto_refill_interval_sec))
+            timeout = max(1.0, self.config.auto_refill_interval_sec, self.config.watermark_interval_sec)
+            self.auto_refill_thread.join(timeout=timeout)
 
     def _auto_refill_loop(self) -> None:
-        while not self.stop_event.wait(max(0.5, self.config.auto_refill_interval_sec)):
+        while True:
+            interval = self.config.watermark_interval_sec if self.config.watermark_mode else self.config.auto_refill_interval_sec
+            if self.stop_event.wait(max(0.2, interval)):
+                break
             try:
                 status = self.maybe_refill()
                 allocated = int(status.get("allocated_bytes", 0) or 0)
@@ -300,6 +369,10 @@ class VramGuardian:
             "auto_refill_interval_sec": self.config.auto_refill_interval_sec,
             "auto_refill_min_delta_mb": self.config.auto_refill_min_delta_mb,
             "auto_refill_paused_sec": round(paused_sec, 2),
+            "watermark_mode": self.config.watermark_mode,
+            "watermark_free_mb": self.config.watermark_free_mb,
+            "watermark_hysteresis_mb": self.config.watermark_hysteresis_mb,
+            "watermark_interval_sec": self.config.watermark_interval_sec,
             "chunks": len(self.chunks),
             "held_bytes": held,
             "held_mb": round(held / MIB, 2),
@@ -412,6 +485,17 @@ class GuardianTCPServer(socketserver.ThreadingTCPServer):
             if mb > 0:
                 bytes_to_release = mb * MIB
             return self.guardian.release(bytes_to_release, pause_refill_sec=pause_refill_sec)
+        if cmd == "set_watermark":
+            mode = request.get("mode", True)
+            if isinstance(mode, str):
+                mode = mode.strip().lower() not in {"0", "false", "no", "off"}
+            free_mb = request.get("free_mb")
+            hysteresis_mb = request.get("hysteresis_mb")
+            return self.guardian.set_watermark(
+                bool(mode),
+                None if free_mb is None else int(free_mb),
+                None if hysteresis_mb is None else int(hysteresis_mb),
+            )
         if cmd == "set_fraction":
             return self.guardian.set_fraction(float(request["fraction"]))
         raise ValueError(f"unknown command: {cmd!r}")
@@ -465,6 +549,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=env_int("VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB", 256),
         type=int,
     )
+    parser.add_argument("--watermark-mode", default=env_bool("VRAM_GUARDIAN_WATERMARK_MODE", False), type=env_bool_arg)
+    parser.add_argument("--watermark-free-mb", default=env_int("VRAM_GUARDIAN_WATERMARK_FREE_MB", 0), type=int)
+    parser.add_argument("--watermark-hysteresis-mb", default=env_int("VRAM_GUARDIAN_WATERMARK_HYSTERESIS_MB", 2048), type=int)
+    parser.add_argument(
+        "--watermark-interval-sec",
+        default=env_float("VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC", 1.0),
+        type=float,
+    )
     parser.add_argument("--log-level", default=os.getenv("VRAM_GUARDIAN_LOG_LEVEL", "INFO"))
     return parser
 
@@ -489,6 +581,10 @@ def main() -> int:
             auto_refill=args.auto_refill,
             auto_refill_interval_sec=args.auto_refill_interval_sec,
             auto_refill_min_delta_mb=args.auto_refill_min_delta_mb,
+            watermark_mode=args.watermark_mode,
+            watermark_free_mb=args.watermark_free_mb,
+            watermark_hysteresis_mb=args.watermark_hysteresis_mb,
+            watermark_interval_sec=args.watermark_interval_sec,
         )
     )
     initial_status = guardian.fill()

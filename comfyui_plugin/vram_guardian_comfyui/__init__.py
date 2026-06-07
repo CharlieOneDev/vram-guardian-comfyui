@@ -45,6 +45,10 @@ RELEASE_BEFORE_NODE = _env_bool("VRAM_GUARDIAN_RELEASE_BEFORE_NODE", False)
 RETRY_SLEEP = _env_float("VRAM_GUARDIAN_RETRY_SLEEP_SEC", 0.5)
 RECLAIM_ON_SUCCESS = _env_bool("VRAM_GUARDIAN_RECLAIM_ON_SUCCESS", True)
 RECLAIM_DELAY = _env_float("VRAM_GUARDIAN_RECLAIM_DELAY_SEC", 0.0)
+ACTIVE_FREE_MB = _env_int("VRAM_GUARDIAN_ACTIVE_FREE_MB", 0)
+ACTIVE_HYSTERESIS_MB = _env_int("VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB", 2048)
+ACTIVE_RECLAIM_ON_EXIT = _env_bool("VRAM_GUARDIAN_ACTIVE_RECLAIM_ON_EXIT", True)
+HEAVY_NODES = {name.strip() for name in os.getenv("VRAM_GUARDIAN_HEAVY_NODES", "").split(",") if name.strip()}
 
 
 def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
@@ -59,6 +63,17 @@ def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
     except Exception as exc:
         LOG.warning("VRAM Guardian request %s failed: %s", cmd, exc)
         return None
+
+
+def _set_watermark(mode: bool, free_mb: int | None = None, hysteresis_mb: int | None = None) -> dict[str, Any] | None:
+    fields: dict[str, Any] = {"mode": mode}
+    if free_mb is not None:
+        fields["free_mb"] = free_mb
+    if hysteresis_mb is not None:
+        fields["hysteresis_mb"] = hysteresis_mb
+    response = _guardian_request("set_watermark", **fields)
+    LOG.info("VRAM Guardian watermark response: %s", response)
+    return response
 
 
 def _release_guardian() -> None:
@@ -106,6 +121,23 @@ def _node_label(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     return f"{node_name}#{unique_id}" if unique_id is not None else node_name
 
 
+def _node_obj(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if "obj" in kwargs:
+        return kwargs["obj"]
+    if len(args) > 2:
+        return args[2]
+    return None
+
+
+def _is_active_watermark_node(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    if ACTIVE_FREE_MB <= 0:
+        return False
+    if not HEAVY_NODES:
+        return True
+    obj = _node_obj(args, kwargs)
+    return obj is not None and type(obj).__name__ in HEAVY_NODES
+
+
 async def _async_sleep() -> None:
     if RETRY_SLEEP > 0:
         await asyncio.sleep(RETRY_SLEEP)
@@ -122,15 +154,30 @@ def _install_get_output_data_patch() -> None:
 
         async def patched_get_output_data(*args: Any, **kwargs: Any) -> Any:
             label = _node_label(args, kwargs)
+            active_watermark = _is_active_watermark_node(args, kwargs)
             for attempt in range(MAX_RETRY + 1):
+                watermark_enabled = False
+                succeeded = False
                 try:
-                    if RELEASE_BEFORE_NODE and attempt == 0:
+                    if active_watermark:
+                        LOG.info(
+                            "enabling Guardian active watermark before node %s: free=%sMB hysteresis=%sMB",
+                            label,
+                            ACTIVE_FREE_MB,
+                            ACTIVE_HYSTERESIS_MB,
+                        )
+                        _set_watermark(True, ACTIVE_FREE_MB, ACTIVE_HYSTERESIS_MB)
+                        watermark_enabled = True
+                        _local_cuda_cleanup()
+                        await _async_sleep()
+                    if RELEASE_BEFORE_NODE and not active_watermark and attempt == 0:
                         LOG.info("releasing Guardian VRAM before node %s", label)
                         _release_guardian()
                         _local_cuda_cleanup()
                         await _async_sleep()
                     result = await original(*args, **kwargs)
-                    if RECLAIM_ON_SUCCESS:
+                    succeeded = True
+                    if RECLAIM_ON_SUCCESS and not active_watermark:
                         _reclaim_guardian()
                     return result
                 except Exception as exc:
@@ -145,6 +192,11 @@ def _install_get_output_data_patch() -> None:
                     _release_guardian()
                     _local_cuda_cleanup()
                     await _async_sleep()
+                finally:
+                    if watermark_enabled:
+                        _set_watermark(False)
+                        if succeeded and ACTIVE_RECLAIM_ON_EXIT and RECLAIM_ON_SUCCESS:
+                            _reclaim_guardian()
 
         patched_get_output_data._vram_guardian_patched = True  # type: ignore[attr-defined]
         patched_get_output_data._vram_guardian_original = original  # type: ignore[attr-defined]
@@ -154,16 +206,32 @@ def _install_get_output_data_patch() -> None:
 
     def patched_get_output_data(*args: Any, **kwargs: Any) -> Any:
         label = _node_label(args, kwargs)
+        active_watermark = _is_active_watermark_node(args, kwargs)
         for attempt in range(MAX_RETRY + 1):
+            watermark_enabled = False
+            succeeded = False
             try:
-                if RELEASE_BEFORE_NODE and attempt == 0:
+                if active_watermark:
+                    LOG.info(
+                        "enabling Guardian active watermark before node %s: free=%sMB hysteresis=%sMB",
+                        label,
+                        ACTIVE_FREE_MB,
+                        ACTIVE_HYSTERESIS_MB,
+                    )
+                    _set_watermark(True, ACTIVE_FREE_MB, ACTIVE_HYSTERESIS_MB)
+                    watermark_enabled = True
+                    _local_cuda_cleanup()
+                    if RETRY_SLEEP > 0:
+                        time.sleep(RETRY_SLEEP)
+                if RELEASE_BEFORE_NODE and not active_watermark and attempt == 0:
                     LOG.info("releasing Guardian VRAM before node %s", label)
                     _release_guardian()
                     _local_cuda_cleanup()
                     if RETRY_SLEEP > 0:
                         time.sleep(RETRY_SLEEP)
                 result = original(*args, **kwargs)
-                if RECLAIM_ON_SUCCESS:
+                succeeded = True
+                if RECLAIM_ON_SUCCESS and not active_watermark:
                     _reclaim_guardian()
                 return result
             except Exception as exc:
@@ -179,6 +247,11 @@ def _install_get_output_data_patch() -> None:
                 _local_cuda_cleanup()
                 if RETRY_SLEEP > 0:
                     time.sleep(RETRY_SLEEP)
+            finally:
+                if watermark_enabled:
+                    _set_watermark(False)
+                    if succeeded and ACTIVE_RECLAIM_ON_EXIT and RECLAIM_ON_SUCCESS:
+                        _reclaim_guardian()
 
     patched_get_output_data._vram_guardian_patched = True  # type: ignore[attr-defined]
     patched_get_output_data._vram_guardian_original = original  # type: ignore[attr-defined]

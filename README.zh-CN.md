@@ -134,6 +134,10 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI 插件在每个节点执行前先释放 Guardian。默认：`false`。
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 后暂停 auto-refill，给 ComfyUI 留出分配时间。默认：`3600`。
 - `VRAM_GUARDIAN_COMFYUI_PID`: 可选，用于自动识别不准时，指定 ComfyUI PID 以便日志区分 ComfyUI 显存。
+- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: 插件在匹配节点运行期间开启 Guardian watermark 模式，并维持这么多空闲显存。默认：`0`，表示关闭。
+- `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: 空闲显存超过目标多少后，Guardian 才补占多余部分。默认：`2048`。
+- `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class 名称。为空时，只要设置了 `ACTIVE_FREE_MB` 就对所有节点生效。
+- `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: Guardian 在 watermark 模式下的检查间隔。默认：`1`。
 
 ## 安装 ComfyUI 插件
 
@@ -170,6 +174,21 @@ VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
 VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
+
+对于长时间运行的重节点，更推荐 active watermark 模式。Guardian 会在节点执行期间维持一段目标空闲显存，同时继续占住多余显存作为防抢占保护：
+
+```bash
+VRAM_GUARDIAN_HOST=127.0.0.1 \
+VRAM_GUARDIAN_PORT=8765 \
+VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner \
+VRAM_GUARDIAN_ACTIVE_FREE_MB=20480 \
+VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=2048 \
+VRAM_GUARDIAN_RELEASE_BEFORE_NODE=0 \
+VRAM_GUARDIAN_RECLAIM_ON_SUCCESS=1 \
+python main.py
+```
+
+这个模式下，如果空闲显存低于 `ACTIVE_FREE_MB`，Guardian 会动态释放 chunk；如果空闲显存高于 `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB`，Guardian 才会补占多余部分。
 
 如果 ComfyUI 运行在同一个 compose 网络里的另一个 Docker 容器中，设置：
 

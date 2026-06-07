@@ -130,6 +130,10 @@ Useful environment variables:
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin releases Guardian before each node. Default: `false`.
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: pause auto-refill after release so ComfyUI can allocate. Default: `3600`.
 - `VRAM_GUARDIAN_COMFYUI_PID`: optional PID used to classify ComfyUI VRAM in Guardian logs when auto-detection is not enough.
+- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: ComfyUI plugin enables Guardian watermark mode during matching nodes and keeps this much VRAM free. Default: `0` disabled.
+- `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: free-VRAM band before Guardian fills surplus again. Default: `2048`.
+- `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated node class names that should use active watermark mode. Empty means all nodes when `ACTIVE_FREE_MB` is set.
+- `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: Guardian check interval while watermark mode is active. Default: `1`.
 
 ## Install the ComfyUI plugin
 
@@ -166,6 +170,21 @@ VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
 VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
+
+For long-running heavy nodes, prefer active watermark mode. Guardian keeps a target amount of free VRAM available while still holding the surplus as a reservation:
+
+```bash
+VRAM_GUARDIAN_HOST=127.0.0.1 \
+VRAM_GUARDIAN_PORT=8765 \
+VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner \
+VRAM_GUARDIAN_ACTIVE_FREE_MB=20480 \
+VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=2048 \
+VRAM_GUARDIAN_RELEASE_BEFORE_NODE=0 \
+VRAM_GUARDIAN_RECLAIM_ON_SUCCESS=1 \
+python main.py
+```
+
+In this mode, Guardian dynamically releases chunks if free VRAM drops below `ACTIVE_FREE_MB`, and fills again only when free VRAM rises above `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB`.
 
 If ComfyUI runs in another Docker container on the same compose network, set:
 
