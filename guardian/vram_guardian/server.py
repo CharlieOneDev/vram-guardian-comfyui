@@ -278,6 +278,42 @@ class VramGuardian:
             )
             return status
 
+    def ensure_free(self, free_mb: int, pause_refill_sec: float = 0.0) -> dict[str, Any]:
+        with self.lock:
+            target_bytes = max(0, int(free_mb)) * MIB
+            free, _ = self.mem_info_unlocked()
+            needed = max(0, target_bytes - free)
+            if pause_refill_sec > 0:
+                self.auto_refill_paused_until = max(self.auto_refill_paused_until, time.monotonic() + pause_refill_sec)
+            released = self.release_bytes_unlocked(needed)
+            if released > 0 and self.config.watermark_mode:
+                self.watermark_cooldown_until = time.monotonic() + max(0.0, self.config.watermark_release_cooldown_sec)
+            self.wake_event.set()
+
+            if released > 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    LOG.debug("torch.cuda.ipc_collect failed", exc_info=True)
+
+            status = self.status_unlocked(
+                extra={
+                    "requested_free_mb": free_mb,
+                    "released_bytes": released,
+                    "watermark_action": "ensure_free",
+                }
+            )
+            LOG.info(
+                "ensure_free target=%sMiB released=%.2f MiB pause_refill=%.1fs | %s",
+                free_mb,
+                released / MIB,
+                pause_refill_sec,
+                self.format_memory_summary(status),
+            )
+            return status
+
     def set_watermark(
         self,
         mode: bool,
@@ -553,6 +589,10 @@ class GuardianTCPServer(socketserver.ThreadingTCPServer):
             if mb > 0:
                 bytes_to_release = mb * MIB
             return self.guardian.release(bytes_to_release, pause_refill_sec=pause_refill_sec)
+        if cmd in {"ensure_free", "release_until_free"}:
+            free_mb = int(request.get("free_mb", 0) or 0)
+            pause_refill_sec = float(request.get("pause_refill_sec", 0) or 0)
+            return self.guardian.ensure_free(free_mb, pause_refill_sec=pause_refill_sec)
         if cmd == "set_watermark":
             mode = request.get("mode", True)
             if isinstance(mode, str):

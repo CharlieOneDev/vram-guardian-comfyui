@@ -4,7 +4,9 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -34,6 +36,28 @@ def _env_float(name: str, default: float) -> float:
     return default if value is None or value == "" else float(value)
 
 
+def _env_int_map(name: str) -> dict[str, int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        LOG.warning("invalid %s JSON: %s", name, exc)
+        return {}
+    if not isinstance(data, dict):
+        LOG.warning("%s must be a JSON object", name)
+        return {}
+
+    result: dict[str, int] = {}
+    for key, value in data.items():
+        try:
+            result[str(key)] = int(value)
+        except (TypeError, ValueError):
+            LOG.warning("ignoring non-integer %s entry for %s: %r", name, key, value)
+    return result
+
+
 ENABLED = _env_bool("VRAM_GUARDIAN_ENABLED", True)
 HOST = os.getenv("VRAM_GUARDIAN_HOST", "127.0.0.1")
 PORT = _env_int("VRAM_GUARDIAN_PORT", 8765)
@@ -50,11 +74,25 @@ ACTIVE_HYSTERESIS_MB = _env_int("VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB", 2048)
 ACTIVE_RECLAIM_ON_EXIT = _env_bool("VRAM_GUARDIAN_ACTIVE_RECLAIM_ON_EXIT", True)
 ACTIVE_SCOPE = os.getenv("VRAM_GUARDIAN_ACTIVE_SCOPE", "prompt").strip().lower()
 HEAVY_NODES = {name.strip() for name in os.getenv("VRAM_GUARDIAN_HEAVY_NODES", "").split(",") if name.strip()}
+BASE_FREE_MB = _env_int("VRAM_GUARDIAN_BASE_FREE_MB", 0)
+HEAVY_FREE_MB = _env_int("VRAM_GUARDIAN_HEAVY_FREE_MB", ACTIVE_FREE_MB)
+NODE_FREE_MAP = _env_int_map("VRAM_GUARDIAN_NODE_FREE_MAP")
+SCHEDULER_ENABLE = _env_bool("VRAM_GUARDIAN_SCHEDULER_ENABLE", BASE_FREE_MB > 0 or HEAVY_FREE_MB > 0 or bool(NODE_FREE_MAP))
+SCHEDULER_WAIT_TIMEOUT = _env_float("VRAM_GUARDIAN_WAIT_TIMEOUT_SEC", 120.0)
+SCHEDULER_WAIT_POLL = _env_float("VRAM_GUARDIAN_WAIT_POLL_SEC", 0.5)
+SCHEDULER_LOG_INTERVAL = _env_float("VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC", 5.0)
+SCHEDULER_MONITOR_INTERVAL = _env_float("VRAM_GUARDIAN_MONITOR_INTERVAL_SEC", 0.5)
+OOM_BUMP_MB = _env_int("VRAM_GUARDIAN_OOM_BUMP_MB", 4096)
+PROFILE_ENABLE = _env_bool("VRAM_GUARDIAN_PROFILE_ENABLE", False)
+PROFILE_PATH = Path(os.getenv("VRAM_GUARDIAN_PROFILE_PATH", "vram_guardian_profile.json"))
+PROFILE_MARGIN_MB = _env_int("VRAM_GUARDIAN_PROFILE_MARGIN_MB", 2048)
 PROMPT_SCOPES = {"prompt", "workflow", "comfyui"}
 NODE_SCOPES = {"node", "nodes"}
 _PROMPT_WATERMARK_TOKEN: str | None = None
 _PROMPT_WATERMARK_LABEL: str | None = None
 _PROMPT_SCOPE_PATCHED = False
+_PROFILE_LOCK = threading.RLock()
+_PROFILE_DATA: dict[str, Any] = {}
 
 
 def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
@@ -69,6 +107,16 @@ def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
     except Exception as exc:
         LOG.warning("VRAM Guardian request %s failed: %s", cmd, exc)
         return None
+
+
+def _guardian_status() -> dict[str, Any] | None:
+    return _guardian_request("status")
+
+
+def _ensure_guardian_free(free_mb: int) -> dict[str, Any] | None:
+    response = _guardian_request("ensure_free", free_mb=free_mb, pause_refill_sec=RELEASE_REFILL_PAUSE)
+    LOG.info("VRAM Guardian ensure_free response: %s", response)
+    return response
 
 
 def _set_watermark(
@@ -156,6 +204,16 @@ def _node_unique_id(args: tuple[Any, ...], kwargs: dict[str, Any], obj: Any) -> 
     return unique_id
 
 
+def _node_input_data(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if "input_data_all" in kwargs:
+        return kwargs["input_data_all"]
+    if len(args) > 3 and isinstance(args[3], dict):
+        return args[3]
+    if len(args) > 1 and isinstance(args[1], dict):
+        return args[1]
+    return {}
+
+
 def _node_label(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
     obj = _node_obj(args, kwargs)
     unique_id = _node_unique_id(args, kwargs, obj)
@@ -180,23 +238,287 @@ def _is_active_watermark_node(args: tuple[Any, ...], kwargs: dict[str, Any]) -> 
 
 
 def _is_active_watermark_prompt() -> bool:
-    return _PROMPT_SCOPE_PATCHED and ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in PROMPT_SCOPES
+    return _PROMPT_SCOPE_PATCHED and (
+        (SCHEDULER_ENABLE and BASE_FREE_MB > 0) or (ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in PROMPT_SCOPES)
+    )
+
+
+def _load_profile() -> None:
+    global _PROFILE_DATA
+
+    if not PROFILE_ENABLE:
+        _PROFILE_DATA = {"version": 1, "nodes": {}}
+        return
+    try:
+        with PROFILE_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        data = {"version": 1, "nodes": {}}
+    except Exception as exc:
+        LOG.warning("failed to load VRAM Guardian profile %s: %s", PROFILE_PATH, exc)
+        data = {"version": 1, "nodes": {}}
+
+    if not isinstance(data, dict):
+        data = {"version": 1, "nodes": {}}
+    if not isinstance(data.get("nodes"), dict):
+        data["nodes"] = {}
+    _PROFILE_DATA = data
+
+
+def _save_profile() -> None:
+    if not PROFILE_ENABLE:
+        return
+    try:
+        PROFILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PROFILE_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(_PROFILE_DATA, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except Exception as exc:
+        LOG.warning("failed to save VRAM Guardian profile %s: %s", PROFILE_PATH, exc)
+
+
+def _profile_entry(class_name: str) -> dict[str, Any] | None:
+    if not PROFILE_ENABLE:
+        return None
+    with _PROFILE_LOCK:
+        nodes = _PROFILE_DATA.setdefault("nodes", {})
+        entry = nodes.get(class_name)
+        return entry if isinstance(entry, dict) else None
+
+
+def _profile_target_mb(class_name: str) -> int:
+    entry = _profile_entry(class_name)
+    if not entry:
+        return 0
+    try:
+        return max(0, int(entry.get("target_free_mb", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _input_signature(input_data_all: Any) -> dict[str, Any]:
+    if not isinstance(input_data_all, dict):
+        return {}
+
+    signature: dict[str, Any] = {}
+    for key, values in input_data_all.items():
+        value = values[0] if isinstance(values, (list, tuple)) and values else values
+        item: dict[str, Any] = {"type": type(value).__name__}
+        shape = getattr(value, "shape", None)
+        if shape is not None:
+            try:
+                item["shape"] = [int(part) for part in shape]
+            except Exception:
+                item["shape"] = str(shape)
+        elif isinstance(value, (str, int, float, bool)):
+            item["value"] = value
+        elif isinstance(value, (list, tuple)):
+            item["length"] = len(value)
+        elif isinstance(value, dict):
+            item["keys"] = sorted(str(name) for name in value.keys())[:20]
+        signature[str(key)] = item
+    return signature
+
+
+def _record_profile(run: "SchedulerRun", *, oom: bool = False, success: bool = False, bump: bool = False) -> None:
+    if not PROFILE_ENABLE:
+        return
+
+    duration = max(0.0, time.monotonic() - run.started_at)
+    min_free = run.min_free_mb if run.min_free_mb is not None else run.start_free_mb
+    peak_need = max(0, int((run.start_free_mb or run.target_free_mb) - (min_free or 0)))
+    learned_target = max(run.target_free_mb, peak_need + PROFILE_MARGIN_MB)
+    if bump:
+        learned_target = max(learned_target, run.target_free_mb + OOM_BUMP_MB)
+
+    with _PROFILE_LOCK:
+        nodes = _PROFILE_DATA.setdefault("nodes", {})
+        entry = nodes.setdefault(run.class_name, {})
+        current_target = int(entry.get("target_free_mb", 0) or 0)
+        entry["target_free_mb"] = max(current_target, learned_target)
+        entry["runs"] = int(entry.get("runs", 0) or 0) + (1 if success else 0)
+        entry["ooms"] = int(entry.get("ooms", 0) or 0) + (1 if oom else 0)
+        entry["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        entry["last"] = {
+            "node_id": run.node_id,
+            "target_free_mb": run.target_free_mb,
+            "start_free_mb": run.start_free_mb,
+            "min_free_mb": min_free,
+            "end_free_mb": run.end_free_mb,
+            "peak_need_mb": peak_need,
+            "duration_sec": round(duration, 3),
+            "oom": oom,
+            "success": success,
+            "input_signature": run.input_signature,
+        }
+        _save_profile()
+
+
+def _record_oom_bump(
+    label: str,
+    class_name: str,
+    node_id: Any,
+    target_free_mb: int,
+    input_signature: dict[str, Any],
+) -> None:
+    if not PROFILE_ENABLE:
+        return
+    run = SchedulerRun(label, class_name, node_id, max(target_free_mb, BASE_FREE_MB, ACTIVE_FREE_MB), input_signature)
+    run.start(_guardian_status())
+    run.stop()
+    _record_profile(run, oom=True, success=False, bump=True)
+
+
+def _scheduler_prompt_target_mb() -> int:
+    if SCHEDULER_ENABLE and BASE_FREE_MB > 0:
+        return BASE_FREE_MB
+    if ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in PROMPT_SCOPES:
+        return ACTIVE_FREE_MB
+    return 0
+
+
+def _scheduler_node_target_mb(class_name: str) -> tuple[int, str]:
+    if not SCHEDULER_ENABLE:
+        if ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in NODE_SCOPES:
+            return ACTIVE_FREE_MB, "legacy-active"
+        return 0, "disabled"
+
+    target = 0
+    source = "none"
+    if class_name in NODE_FREE_MAP:
+        target = NODE_FREE_MAP[class_name]
+        source = "node-map"
+    elif class_name in HEAVY_NODES and HEAVY_FREE_MB > 0:
+        target = HEAVY_FREE_MB
+        source = "heavy"
+    elif _PROMPT_WATERMARK_TOKEN is None and BASE_FREE_MB > 0:
+        target = BASE_FREE_MB
+        source = "base"
+
+    profile_target = _profile_target_mb(class_name)
+    if profile_target > target:
+        target = profile_target
+        source = "profile"
+
+    return max(0, target), source
+
+
+def _status_free_mb(status: dict[str, Any] | None) -> float:
+    if not status:
+        return 0.0
+    try:
+        return float(status.get("free_mb", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _status_held_mb(status: dict[str, Any] | None) -> float:
+    if not status:
+        return 0.0
+    try:
+        return float(status.get("held_mb", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wait_for_free_mb(label: str, target_free_mb: int) -> dict[str, Any] | None:
+    if target_free_mb <= 0:
+        return _guardian_status()
+
+    deadline = None if SCHEDULER_WAIT_TIMEOUT <= 0 else time.monotonic() + SCHEDULER_WAIT_TIMEOUT
+    next_log = 0.0
+    status = _ensure_guardian_free(target_free_mb)
+
+    while True:
+        free_mb = _status_free_mb(status)
+        if free_mb >= target_free_mb:
+            LOG.info("[VRAM Scheduler] %s free reached %.0fMiB target=%sMiB; continuing", label, free_mb, target_free_mb)
+            return status
+
+        now = time.monotonic()
+        held_mb = _status_held_mb(status)
+        if now >= next_log:
+            LOG.info(
+                "[VRAM Scheduler] %s waiting: free=%.0fMiB target=%sMiB guardian_held=%.0fMiB",
+                label,
+                free_mb,
+                target_free_mb,
+                held_mb,
+            )
+            if held_mb <= 0:
+                LOG.warning(
+                    "[VRAM Scheduler] %s Guardian holds no VRAM but free is still below target; another process may be using the GPU",
+                    label,
+                )
+            next_log = now + max(1.0, SCHEDULER_LOG_INTERVAL)
+
+        if deadline is not None and now >= deadline:
+            LOG.warning(
+                "[VRAM Scheduler] %s wait timed out after %.1fs: free=%.0fMiB target=%sMiB",
+                label,
+                SCHEDULER_WAIT_TIMEOUT,
+                free_mb,
+                target_free_mb,
+            )
+            return status
+
+        time.sleep(max(0.05, SCHEDULER_WAIT_POLL))
+        status = _ensure_guardian_free(target_free_mb)
+
+
+class SchedulerRun:
+    def __init__(self, label: str, class_name: str, node_id: Any, target_free_mb: int, input_signature: dict[str, Any]) -> None:
+        self.label = label
+        self.class_name = class_name
+        self.node_id = None if node_id is None else str(node_id)
+        self.target_free_mb = target_free_mb
+        self.input_signature = input_signature
+        self.started_at = time.monotonic()
+        self.start_free_mb = 0.0
+        self.min_free_mb: float | None = None
+        self.end_free_mb: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, initial_status: dict[str, Any] | None = None) -> None:
+        self.sample(initial_status or _guardian_status())
+        self.start_free_mb = self.min_free_mb or 0.0
+        if SCHEDULER_MONITOR_INTERVAL <= 0:
+            return
+        self._thread = threading.Thread(target=self._loop, name=f"vram-scheduler-{self.class_name}", daemon=True)
+        self._thread.start()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(max(0.1, SCHEDULER_MONITOR_INTERVAL)):
+            self.sample(_guardian_status())
+
+    def sample(self, status: dict[str, Any] | None) -> None:
+        free = _status_free_mb(status)
+        if self.min_free_mb is None or free < self.min_free_mb:
+            self.min_free_mb = free
+        self.end_free_mb = free
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, SCHEDULER_MONITOR_INTERVAL * 2))
+        self.sample(_guardian_status())
 
 
 def _watermark_token(label: str) -> str:
     return f"{os.getpid()}:{label}:{time.monotonic_ns()}"
 
 
-def _begin_watermark(label: str) -> str:
+def _begin_watermark(label: str, free_mb: int, hysteresis_mb: int = ACTIVE_HYSTERESIS_MB) -> str:
     token = _watermark_token(label)
     LOG.info(
         "enabling Guardian active watermark for %s: free=%sMB hysteresis=%sMB token=%s",
         label,
-        ACTIVE_FREE_MB,
-        ACTIVE_HYSTERESIS_MB,
+        free_mb,
+        hysteresis_mb,
         token,
     )
-    _set_watermark(True, ACTIVE_FREE_MB, ACTIVE_HYSTERESIS_MB, token=token)
+    _set_watermark(True, free_mb, hysteresis_mb, token=token)
     _local_cuda_cleanup()
     return token
 
@@ -231,19 +553,27 @@ def _suspend_prompt_watermark(reason: str) -> None:
 
 def _reclaim_after_active_scope(label: str) -> None:
     if ACTIVE_RECLAIM_ON_EXIT and RECLAIM_ON_SUCCESS:
+        if _PROMPT_WATERMARK_TOKEN is not None:
+            LOG.info("prompt watermark is still active after %s; skipping full reclaim", label)
+            return
         LOG.info("reclaiming Guardian VRAM after active watermark scope %s", label)
         _reclaim_guardian()
 
 
-def _watch_pending_tasks(tasks: list[asyncio.Task[Any]], token: str, label: str) -> None:
+def _watch_pending_tasks(tasks: list[asyncio.Task[Any]], token: str, label: str, run: SchedulerRun | None = None) -> None:
     async def wait_and_close() -> None:
         failed = True
+        oom_failed = False
         try:
             results = await asyncio.gather(*tasks, return_exceptions=True)
             failed = any(isinstance(result, BaseException) for result in results)
+            oom_failed = any(isinstance(result, BaseException) and _is_oom(result) for result in results)
             if failed:
                 LOG.warning("pending tasks for %s ended with an error; Guardian will not reclaim immediately", label)
         finally:
+            if run is not None:
+                run.stop()
+                _record_profile(run, oom=oom_failed, success=not failed, bump=oom_failed)
             _end_watermark(token, label)
             if not failed:
                 _reclaim_after_active_scope(label)
@@ -277,8 +607,9 @@ def _install_prompt_patch() -> None:
 
             label = _prompt_label(args, kwargs)
             token: str | None = None
-            if _is_active_watermark_prompt():
-                token = _begin_watermark(label)
+            target_free_mb = _scheduler_prompt_target_mb()
+            if target_free_mb > 0:
+                token = _begin_watermark(label, target_free_mb)
                 _PROMPT_WATERMARK_TOKEN = token
                 _PROMPT_WATERMARK_LABEL = label
                 await _async_sleep()
@@ -312,8 +643,9 @@ def _install_prompt_patch() -> None:
 
         label = _prompt_label(args, kwargs)
         token: str | None = None
-        if _is_active_watermark_prompt():
-            token = _begin_watermark(label)
+        target_free_mb = _scheduler_prompt_target_mb()
+        if target_free_mb > 0:
+            token = _begin_watermark(label, target_free_mb)
             _PROMPT_WATERMARK_TOKEN = token
             _PROMPT_WATERMARK_LABEL = label
             if RETRY_SLEEP > 0:
@@ -346,39 +678,45 @@ def _install_get_output_data_patch() -> None:
     if inspect.iscoroutinefunction(original):
 
         async def patched_get_output_data(*args: Any, **kwargs: Any) -> Any:
+            obj = _node_obj(args, kwargs)
+            class_name = _node_class_name(obj)
+            node_id = _node_unique_id(args, kwargs, obj)
             label = _node_label(args, kwargs)
-            active_watermark = _is_active_watermark_node(args, kwargs)
-            if active_watermark or ACTIVE_SCOPE in NODE_SCOPES:
-                LOG.info("VRAM Guardian node %s active_watermark=%s", label, active_watermark)
+            input_signature = _input_signature(_node_input_data(args, kwargs))
+            target_free_mb, target_source = _scheduler_node_target_mb(class_name)
+            active_scheduler = target_free_mb > 0
+            if active_scheduler or ACTIVE_SCOPE in NODE_SCOPES:
+                LOG.info(
+                    "[VRAM Scheduler] node=%s class=%s target_free=%sMiB source=%s",
+                    label,
+                    class_name,
+                    target_free_mb,
+                    target_source,
+                )
             else:
-                LOG.debug("VRAM Guardian node %s active_watermark=%s", label, active_watermark)
+                LOG.debug("[VRAM Scheduler] node=%s class=%s target_free=0 source=%s", label, class_name, target_source)
             full_release_retry = False
             for attempt in range(MAX_RETRY + 1):
                 token: str | None = None
+                run: SchedulerRun | None = None
                 succeeded = False
+                profile_recorded = False
                 try:
-                    if active_watermark and not full_release_retry:
-                        token = _watermark_token(label)
-                        LOG.info(
-                            "enabling Guardian active watermark before node %s: free=%sMB hysteresis=%sMB token=%s",
-                            label,
-                            ACTIVE_FREE_MB,
-                            ACTIVE_HYSTERESIS_MB,
-                            token,
-                        )
-                        _set_watermark(True, ACTIVE_FREE_MB, ACTIVE_HYSTERESIS_MB, token=token)
-                        _local_cuda_cleanup()
-                        await _async_sleep()
-                    elif active_watermark and full_release_retry:
-                        LOG.info("running full-release retry for node %s without watermark refill", label)
-                    if RELEASE_BEFORE_NODE and not active_watermark and not _is_active_watermark_prompt() and attempt == 0:
+                    if active_scheduler and not full_release_retry:
+                        token = _begin_watermark(label, target_free_mb)
+                        status = _wait_for_free_mb(label, target_free_mb)
+                        run = SchedulerRun(label, class_name, node_id, target_free_mb, input_signature)
+                        run.start(status)
+                    elif active_scheduler and full_release_retry:
+                        LOG.info("[VRAM Scheduler] running full-release retry for node %s without watermark refill", label)
+                    if RELEASE_BEFORE_NODE and not active_scheduler and not _is_active_watermark_prompt() and attempt == 0:
                         LOG.info("releasing Guardian VRAM before node %s", label)
                         _release_guardian()
                         _local_cuda_cleanup()
                         await _async_sleep()
                     result = await original(*args, **kwargs)
                     succeeded = True
-                    if active_watermark and token is not None:
+                    if active_scheduler and token is not None:
                         pending_tasks = _pending_tasks_from_result(result)
                         if pending_tasks:
                             LOG.info(
@@ -386,15 +724,22 @@ def _install_get_output_data_patch() -> None:
                                 label,
                                 len(pending_tasks),
                             )
-                            _watch_pending_tasks(pending_tasks, token, label)
+                            _watch_pending_tasks(pending_tasks, token, label, run)
                             token = None
-                    elif active_watermark and full_release_retry:
+                            run = None
+                            profile_recorded = True
+                    elif active_scheduler and full_release_retry:
                         _reclaim_after_active_scope(label)
                     elif RECLAIM_ON_SUCCESS and not _is_active_watermark_prompt():
                         _reclaim_guardian()
                     return result
                 except Exception as exc:
-                    if not _is_oom(exc) or attempt >= MAX_RETRY:
+                    oom = _is_oom(exc)
+                    if not oom or attempt >= MAX_RETRY:
+                        if run is not None:
+                            run.stop()
+                            _record_profile(run, oom=oom, success=False, bump=oom)
+                            profile_recorded = True
                         raise
                     LOG.warning(
                         "CUDA OOM in %s; releasing Guardian VRAM and retrying (%s/%s)",
@@ -402,6 +747,13 @@ def _install_get_output_data_patch() -> None:
                         attempt + 1,
                         MAX_RETRY,
                     )
+                    if run is not None:
+                        run.stop()
+                        _record_profile(run, oom=True, success=False, bump=True)
+                        profile_recorded = True
+                        run = None
+                    else:
+                        _record_oom_bump(label, class_name, node_id, target_free_mb, input_signature)
                     if token is not None:
                         _end_watermark(token, label)
                         token = None
@@ -412,6 +764,10 @@ def _install_get_output_data_patch() -> None:
                     _local_cuda_cleanup()
                     await _async_sleep()
                 finally:
+                    if run is not None and not profile_recorded:
+                        run.stop()
+                        if succeeded:
+                            _record_profile(run, success=True)
                     if token is not None:
                         _end_watermark(token, label)
                         if succeeded:
@@ -424,33 +780,38 @@ def _install_get_output_data_patch() -> None:
         return
 
     def patched_get_output_data(*args: Any, **kwargs: Any) -> Any:
+        obj = _node_obj(args, kwargs)
+        class_name = _node_class_name(obj)
+        node_id = _node_unique_id(args, kwargs, obj)
         label = _node_label(args, kwargs)
-        active_watermark = _is_active_watermark_node(args, kwargs)
-        if active_watermark or ACTIVE_SCOPE in NODE_SCOPES:
-            LOG.info("VRAM Guardian node %s active_watermark=%s", label, active_watermark)
+        input_signature = _input_signature(_node_input_data(args, kwargs))
+        target_free_mb, target_source = _scheduler_node_target_mb(class_name)
+        active_scheduler = target_free_mb > 0
+        if active_scheduler or ACTIVE_SCOPE in NODE_SCOPES:
+            LOG.info(
+                "[VRAM Scheduler] node=%s class=%s target_free=%sMiB source=%s",
+                label,
+                class_name,
+                target_free_mb,
+                target_source,
+            )
         else:
-            LOG.debug("VRAM Guardian node %s active_watermark=%s", label, active_watermark)
+            LOG.debug("[VRAM Scheduler] node=%s class=%s target_free=0 source=%s", label, class_name, target_source)
         full_release_retry = False
         for attempt in range(MAX_RETRY + 1):
             token: str | None = None
+            run: SchedulerRun | None = None
             succeeded = False
+            profile_recorded = False
             try:
-                if active_watermark and not full_release_retry:
-                    token = _watermark_token(label)
-                    LOG.info(
-                        "enabling Guardian active watermark before node %s: free=%sMB hysteresis=%sMB token=%s",
-                        label,
-                        ACTIVE_FREE_MB,
-                        ACTIVE_HYSTERESIS_MB,
-                        token,
-                    )
-                    _set_watermark(True, ACTIVE_FREE_MB, ACTIVE_HYSTERESIS_MB, token=token)
-                    _local_cuda_cleanup()
-                    if RETRY_SLEEP > 0:
-                        time.sleep(RETRY_SLEEP)
-                elif active_watermark and full_release_retry:
-                    LOG.info("running full-release retry for node %s without watermark refill", label)
-                if RELEASE_BEFORE_NODE and not active_watermark and not _is_active_watermark_prompt() and attempt == 0:
+                if active_scheduler and not full_release_retry:
+                    token = _begin_watermark(label, target_free_mb)
+                    status = _wait_for_free_mb(label, target_free_mb)
+                    run = SchedulerRun(label, class_name, node_id, target_free_mb, input_signature)
+                    run.start(status)
+                elif active_scheduler and full_release_retry:
+                    LOG.info("[VRAM Scheduler] running full-release retry for node %s without watermark refill", label)
+                if RELEASE_BEFORE_NODE and not active_scheduler and not _is_active_watermark_prompt() and attempt == 0:
                     LOG.info("releasing Guardian VRAM before node %s", label)
                     _release_guardian()
                     _local_cuda_cleanup()
@@ -458,13 +819,18 @@ def _install_get_output_data_patch() -> None:
                         time.sleep(RETRY_SLEEP)
                 result = original(*args, **kwargs)
                 succeeded = True
-                if active_watermark and full_release_retry:
+                if active_scheduler and full_release_retry:
                     _reclaim_after_active_scope(label)
-                elif RECLAIM_ON_SUCCESS and not active_watermark and not _is_active_watermark_prompt():
+                elif RECLAIM_ON_SUCCESS and not active_scheduler and not _is_active_watermark_prompt():
                     _reclaim_guardian()
                 return result
             except Exception as exc:
-                if not _is_oom(exc) or attempt >= MAX_RETRY:
+                oom = _is_oom(exc)
+                if not oom or attempt >= MAX_RETRY:
+                    if run is not None:
+                        run.stop()
+                        _record_profile(run, oom=oom, success=False, bump=oom)
+                        profile_recorded = True
                     raise
                 LOG.warning(
                     "CUDA OOM in %s; releasing Guardian VRAM and retrying (%s/%s)",
@@ -472,6 +838,13 @@ def _install_get_output_data_patch() -> None:
                     attempt + 1,
                     MAX_RETRY,
                 )
+                if run is not None:
+                    run.stop()
+                    _record_profile(run, oom=True, success=False, bump=True)
+                    profile_recorded = True
+                    run = None
+                else:
+                    _record_oom_bump(label, class_name, node_id, target_free_mb, input_signature)
                 if token is not None:
                     _end_watermark(token, label)
                     token = None
@@ -483,6 +856,10 @@ def _install_get_output_data_patch() -> None:
                 if RETRY_SLEEP > 0:
                     time.sleep(RETRY_SLEEP)
             finally:
+                if run is not None and not profile_recorded:
+                    run.stop()
+                    if succeeded:
+                        _record_profile(run, success=True)
                 if token is not None:
                     _end_watermark(token, label)
                     if succeeded:
@@ -526,6 +903,7 @@ def _install() -> None:
         LOG.info("VRAM Guardian plugin disabled by VRAM_GUARDIAN_ENABLED")
         return
     try:
+        _load_profile()
         _install_prompt_patch()
         _install_get_output_data_patch()
         _install_async_result_patch()

@@ -2,76 +2,61 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-ComfyUI が OOM になったときに CUDA VRAM を解放して再試行できるようにする、実験的な sidecar です。
+VRAM Guardian for ComfyUI は、共有 NVIDIA GPU 環境向けの実験的な VRAM 予約・スケジューリング補助ツールです。
 
-英語版 README がメインドキュメントです。この日本語版は概要とセットアップを素早く確認するためのものです。
-
-これは本物の専用 VRAM プールではありません。他のプロセスが空き VRAM を先に取るのを難しくし、Guardian が保持している tensor を解放したあとに ComfyUI へ再試行の機会を与える仕組みです。
+Guardian プロセスが CUDA tensor で VRAM を保持し、ComfyUI プラグインが workflow と node の実行タイミングに合わせて release、wait、refill を指示します。目的は、他プロセスによる VRAM の奪取をできるだけ抑えつつ、ComfyUI の重い node に必要な一時的な空き VRAM を確保することです。
 
 ## 構成
 
-- `guardian/`: CUDA tensor を割り当てて VRAM を保持する TCP サービス。
-- `comfyui_plugin/`: `execution.get_output_data` を patch する ComfyUI `custom_nodes` プラグイン。
-- `docker-compose.yml`: Linux/NVIDIA Docker 向け sidecar サービス。
-- `scripts/`: プラグインを ComfyUI にコピーするための補助スクリプト。
+- `guardian/`: VRAM を保持する TCP service と CLI client。
+- `comfyui_plugin/`: ComfyUI の `custom_nodes` plugin。実行処理を monkey-patch して VRAM scheduling を行います。
+- `scripts/`: plugin install と direct run 用 helper。
+- `docker-compose.yml`: optional Docker sidecar。
+- `Dockerfile`: optional Guardian container image。
 
-## Guardian sidecar の起動
+## 重要な制限
 
-前提条件:
+このツールは ComfyUI 専用の private VRAM pool を作るものではありません。Guardian が release した VRAM は CUDA driver に戻るため、他プロセスが取得する可能性は残ります。
 
-- ホストから NVIDIA GPU が見えること。`nvidia-smi` で確認します。
-- Docker と Docker Compose が入っていること。`docker --version` と `docker compose version` で確認します。
-- Docker から GPU にアクセスできること。次のコマンドで確認します。
+できること:
+
+- node 開始前に release と wait を行う。
+- node 実行中に target free VRAM watermark を維持する。
+- node 終了後に base watermark に戻す。
+- OOM 後に release、CUDA cache cleanup、retry を行う。
+
+できないこと:
+
+- 任意の低レベル `cudaMalloc` を瞬間的に完全制御する。
+- すでに他プロセスが占有している VRAM を強制的に取り戻す。
+- GPU 容量を超える workflow を成功させる。
+
+## Guardian の起動
+
+### Docker Compose
+
+Docker が NVIDIA GPU に直接アクセスできる場合:
 
 ```bash
+nvidia-smi
+docker --version
+docker compose version
 docker run --rm --gpus all ubuntu nvidia-smi
 ```
-
-このコマンドで `nvidia-smi` の GPU テーブルが表示されれば、Docker から GPU を利用できます。失敗する場合は、Guardian を起動する前に Docker の GPU アクセスを直してください。
-
-Windows では Docker Desktop の WSL2 backend を使ってください。Docker の公式ドキュメントでは、Docker Desktop for Windows の GPU support は WSL2 backend で利用できると説明されています。また Docker Engine のドキュメントでは、`--gpus` flag で NVIDIA GPU をコンテナへ公開する方法が説明されています。ネイティブ Linux では NVIDIA Container Toolkit をインストールして Docker に設定します。参考:
-
-- Docker GPU access: <https://docs.docker.com/engine/containers/gpu/>
-- Docker Desktop GPU support: <https://docs.docker.com/desktop/features/gpu/>
-- NVIDIA Container Toolkit install guide: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
-- NVIDIA sample workload check: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/sample-workload.html>
-
-Linux で NVIDIA Container Toolkit が未インストールの場合は、NVIDIA の公式ガイドに従ってインストールしたあと、通常は次を実行します。
-
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-docker run --rm --gpus all ubuntu nvidia-smi
-```
-
-`/path/to/vram-guardian-comfyui` は、この README と `docker-compose.yml` があるリポジトリのディレクトリを指します。
-
-まだリポジトリを clone していない場合:
 
 ```bash
 git clone https://github.com/CharlieOneDev/vram-guardian-comfyui.git
 cd vram-guardian-comfyui
-```
-
-以前作成した `G:\codex` 下のローカルコピーを使う場合、Windows PowerShell では:
-
-```powershell
-cd G:\codex\vram-guardian-comfyui
-```
-
-WSL terminal から同じ Windows drive を使う場合は、通常:
-
-```bash
-cd /mnt/g/codex/vram-guardian-comfyui
-```
-
-その後 Guardian を起動します。
-
-```bash
 docker compose up -d --build
 ```
 
-Compose implementation が GPU syntax を認識せず、`Additional property gpus is not allowed` のようなエラーを出す場合があります。その場合、Docker 自体は GPU を使えていても、compose file の GPU syntax が新しすぎる可能性があります。次の直接 Docker 起動を使ってください。
+状態確認:
+
+```bash
+docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1 --port 8765
+```
+
+### Direct Docker
 
 ```bash
 docker build -t vram-guardian-comfyui:local .
@@ -85,23 +70,18 @@ docker run -d \
   -e VRAM_GUARDIAN_PORT=8765 \
   -e VRAM_GUARDIAN_DEVICE=cuda:0 \
   -e VRAM_GUARDIAN_FRACTION=0.82 \
-  -e VRAM_GUARDIAN_MIN_FREE_MB=1536 \
-  -e VRAM_GUARDIAN_CHUNK_MB=256 \
-  -e VRAM_GUARDIAN_MAX_HOLD_MB=0 \
-  -e VRAM_GUARDIAN_AUTO_REFILL=true \
-  -e VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC=5 \
-  -e VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB=256 \
   vram-guardian-comfyui:local
 ```
 
-直接 Docker 起動でも NVIDIA runtime initialization の段階で `/proc/driver/nvidia/gpus/... no such file or directory` のようなエラーが出る場合は、現在の CNB/nested Docker 環境では GPU コンテナをさらに重ねるのが合っていません。その場合は direct mode を使い、現在の Linux/CNB/WSL 環境で Guardian プロセスを直接起動します。
+### Direct Python
+
+Nested GPU Docker が使えない環境では、ComfyUI と同じ Linux/WSL2/cloud container で直接起動します。
 
 ```bash
+cd vram-guardian-comfyui
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
-
-direct mode は log を `vram_guardian.log` に、PID を `vram_guardian.pid` に書きます。auto-refill はデフォルトで有効なので、Guardian は新しく空いた VRAM を定期的に確認し、設定された target まで再確保します。
 
 ```bash
 bash scripts/guardian_direct.sh status
@@ -109,113 +89,121 @@ bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
 
-Realtime log には compact な VRAM summary が出ます。
-
-```text
-total=45458MiB free=1536MiB guardian_held=32656MiB target=39086MiB external_calc=11266MiB guardian_proc=33126MiB comfyui=2048MiB other=9218MiB paused=0s
-```
-
-Docker または Compose mode の状態確認:
-
-```bash
-docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1 --port 8765
-```
-
-主な環境変数:
-
-- `VRAM_GUARDIAN_FRACTION`: 保持する GPU 総メモリの目標割合。デフォルト: `0.82`。
-- `VRAM_GUARDIAN_MIN_FREE_MB`: fill 時に残す空き VRAM。デフォルト: `1536`。
-- `VRAM_GUARDIAN_CHUNK_MB`: 割り当て単位。デフォルト: `256`。
-- `VRAM_GUARDIAN_MAX_HOLD_MB`: 絶対的な保持上限。`0` は上限なし。
-- `VRAM_GUARDIAN_DEVICE`: CUDA デバイス。デフォルト: `cuda:0`。
-- `VRAM_GUARDIAN_AUTO_REFILL`: 新しく空いた VRAM を定期的に再確保します。デフォルト: `true`。
-- `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: auto-refill の確認間隔。デフォルト: `5`。
-- `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: auto-refill が割り当てを始める最小増分。デフォルト: `256`。
-- `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin が各 node の実行前に Guardian を解放します。デフォルト: `false`。
-- `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 後に auto-refill を一時停止し、ComfyUI が割り当てる時間を確保します。デフォルト: `3600`。
-- `VRAM_GUARDIAN_COMFYUI_PID`: auto-detection が不十分な場合に、ComfyUI VRAM を分類するための任意 PID。
-- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: plugin が現在の scope の実行中に Guardian watermark mode を有効化し、この量の free VRAM を維持します。デフォルト: `0` disabled。
-- `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: free VRAM が target をどれだけ上回ったら余剰を再確保するか。デフォルト: `2048`。
-- `VRAM_GUARDIAN_ACTIVE_SCOPE`: active watermark の scope。`prompt` は ComfyUI workflow 全体、`node` は指定 node。デフォルト: `prompt`。
-- `VRAM_GUARDIAN_HEAVY_NODES`: `ACTIVE_SCOPE=node` のときだけ使う node class 名の comma-separated list。空の場合、node scope では全 node 対象。
-- `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: watermark mode 中の Guardian check interval。デフォルト: `1`。
-- `VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC`: watermark release 後、Guardian が再確保を検討するまでの短い待機時間。デフォルト: `5`。
-
 ## ComfyUI プラグインのインストール
-
-`comfyui_plugin/vram_guardian_comfyui` を ComfyUI の `custom_nodes` ディレクトリにコピーします。
 
 Linux:
 
 ```bash
+cd vram-guardian-comfyui
 ./scripts/install_plugin.sh /path/to/ComfyUI/custom_nodes
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\scripts\install_plugin.ps1 -ComfyUICustomNodes "F:\path\to\ComfyUI\custom_nodes"
+cd vram-guardian-comfyui
+.\scripts\install_plugin.ps1 -ComfyUICustomNodes "D:\path\to\ComfyUI\custom_nodes"
 ```
 
-その後、以下の環境変数で ComfyUI を起動します。
+インストールまたは更新後、ComfyUI を再起動してください。
+
+## 推奨 Scheduler 設定
+
+48 GiB shared GPU の初期値例:
 
 ```bash
-VRAM_GUARDIAN_HOST=127.0.0.1 \
-VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_MAX_RETRY=1 \
+export VRAM_GUARDIAN_HOST=127.0.0.1
+export VRAM_GUARDIAN_PORT=8765
+export VRAM_GUARDIAN_MAX_RETRY=1
+
+export VRAM_GUARDIAN_SCHEDULER_ENABLE=true
+export VRAM_GUARDIAN_BASE_FREE_MB=6144
+export VRAM_GUARDIAN_HEAVY_FREE_MB=20480
+export VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=1024
+export VRAM_GUARDIAN_WAIT_TIMEOUT_SEC=120
+export VRAM_GUARDIAN_WAIT_POLL_SEC=0.5
+export VRAM_GUARDIAN_MONITOR_INTERVAL_SEC=0.5
+export VRAM_GUARDIAN_OOM_BUMP_MB=4096
+
+export VRAM_GUARDIAN_NODE_FREE_MAP='{
+  "KSampler": 24576,
+  "VAEDecode": 16384,
+  "VAEDecodeTiled": 12288,
+  "UltimateSDUpscale": 24576,
+  "SegmentVSRFIStreamRunner": 24576,
+  "WanVideoSampler": 24576,
+  "LTXVideoSampler": 24576
+}'
+
+export VRAM_GUARDIAN_PROFILE_ENABLE=true
+export VRAM_GUARDIAN_PROFILE_PATH=./vram_guardian_profile.json
+export VRAM_GUARDIAN_PROFILE_MARGIN_MB=2048
+
 python main.py
 ```
 
-Workflow が最初から大量の VRAM を必要とする場合は、最初の OOM を待たずに、各 node の実行前に Guardian を解放できます。
+## Scheduler の流れ
 
-```bash
-VRAM_GUARDIAN_HOST=127.0.0.1 \
-VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_MAX_RETRY=1 \
-VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
-VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
-python main.py
+1. ComfyUI prompt 開始時、plugin が base watermark を開きます。
+2. 通常 node は `BASE_FREE_MB` を基準に実行されます。
+3. `NODE_FREE_MAP` に一致する node は、その target free VRAM まで Guardian を release します。
+4. `HEAVY_NODES` に一致し map がない node は `HEAVY_FREE_MB` を使用します。
+5. node 実行前、plugin は `ensure_free` を呼び、target に届くまで wait します。
+6. node 実行中、Guardian は高い watermark を維持します。
+7. node 終了後、高い watermark を閉じ、base watermark に戻します。
+8. prompt 終了後、Guardian は通常の予約状態に戻ります。
+
+## 主要な環境変数
+
+Guardian:
+
+- `VRAM_GUARDIAN_FRACTION`: GPU memory の保持割合。デフォルト `0.82`。
+- `VRAM_GUARDIAN_MIN_FREE_MB`: 通常 refill 時に残す free VRAM。
+- `VRAM_GUARDIAN_CHUNK_MB`: allocation chunk。
+- `VRAM_GUARDIAN_MAX_HOLD_MB`: 最大保持量。
+- `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: watermark loop interval。
+- `VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC`: release 後の refill cooldown。
+
+ComfyUI plugin:
+
+- `VRAM_GUARDIAN_SCHEDULER_ENABLE`: Scheduler を有効化。
+- `VRAM_GUARDIAN_BASE_FREE_MB`: 通常実行時の target free VRAM。
+- `VRAM_GUARDIAN_HEAVY_FREE_MB`: 未 map の heavy node 用 target。
+- `VRAM_GUARDIAN_NODE_FREE_MAP`: node class と target free MiB の JSON map。
+- `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated heavy node class names。
+- `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: refill hysteresis。
+- `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: node 開始前の最大 wait。
+- `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: runtime sampling interval。
+- `VRAM_GUARDIAN_PROFILE_ENABLE`: local profile JSON を書き込む。
+- `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: learned target の margin。
+- `VRAM_GUARDIAN_OOM_BUMP_MB`: OOM 後に target を増やす量。
+
+## ログ例
+
+Guardian summary:
+
+```text
+total=45458MiB free=6144MiB guardian_held=32768MiB target=40960MiB external_calc=6546MiB guardian_proc=33024MiB comfyui=2048MiB other=4498MiB paused=0s
 ```
 
-汎用的な ComfyUI workflow には prompt-scope active watermark mode を推奨します。Guardian は workflow 実行中に目標 free VRAM を維持しつつ、余剰分は予約として保持します。
+Scheduler:
 
-```bash
-VRAM_GUARDIAN_HOST=127.0.0.1 \
-VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_ACTIVE_SCOPE=prompt \
-VRAM_GUARDIAN_ACTIVE_FREE_MB=20480 \
-VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=2048 \
-VRAM_GUARDIAN_RELEASE_BEFORE_NODE=0 \
-VRAM_GUARDIAN_RECLAIM_ON_SUCCESS=1 \
-python main.py
+```text
+[VRAM Scheduler] node=KSampler#12 class=KSampler target_free=24576MiB source=node-map
+[VRAM Scheduler] KSampler#12 waiting: free=8192MiB target=24576MiB guardian_held=16384MiB
+[VRAM Scheduler] KSampler#12 free reached 24600MiB target=24576MiB; continuing
 ```
 
-この mode では、plugin が現在の scope に token-scoped watermark session を開きます。free VRAM が `ACTIVE_FREE_MB` を下回ると Guardian が chunk を解放し、短い cooldown の後、`ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB` を free VRAM として残しながら余剰分だけ再確保します。node が OOM で retry する場合、その retry は Guardian を全解放した状態で実行され、watermark refill は再有効化されません。
+Guardian がすべて release しても target に届かない場合:
 
-`ACTIVE_FREE_MB` は、その workflow または node が一度に要求しうる最大の瞬間的な headroom に合わせて設定してください。background watcher は、現在の free VRAM より大きい単発 allocation による OOM を事前には防げません。
-
-node 単位で細かく調整したい場合は、`VRAM_GUARDIAN_ACTIVE_SCOPE=node` を設定し、必要に応じて `VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner` を指定します。
-
-ComfyUI が同じ compose ネットワーク上の別 Docker コンテナで動く場合:
-
-```bash
-VRAM_GUARDIAN_HOST=guardian
+```text
+[VRAM Scheduler] KSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
 ```
 
-## 動作の流れ
+## Tuning
 
-1. Guardian は設定された目標に達するまで CUDA byte tensor を割り当てます。
-2. ComfyUI プラグインが `execution.get_output_data` からの CUDA OOM を捕捉します。
-3. プラグインが Guardian に VRAM の解放を依頼します。
-4. プラグインが ComfyUI プロセス内の CUDA cache をクリアし、ノードを再試行します。
-5. ノードが成功したあと、プラグインが Guardian に VRAM の再確保を依頼します。
-
-## 重要な制限
-
-- 解放された VRAM は CUDA driver に戻るだけで、ComfyUI に直接予約されるわけではありません。他のプロセスが先に取る可能性があります。
-- OOM 後の再試行は、すべての custom node で安全とは限りません。副作用を持つノードがあるためです。
-- 深い非同期タスク内の OOM は、解放後に再送出されるだけで、完全には再試行できない場合があります。
-- 共有 GPU プラットフォームでは、大量の VRAM を長時間保持するプロセスが停止または制限される可能性があります。
-- ComfyUI の workflow 自体が GPU の総 VRAM を本当に超えている場合、このツールでは解決できません。
-
-まずは `VRAM_GUARDIAN_FRACTION=0.65` のような保守的な設定から始め、安定性を確認してから上げてください。
+- 通常 node が OOM する場合は `BASE_FREE_MB` を上げます。
+- 特定 node が OOM する場合は `NODE_FREE_MAP` の値を上げます。
+- 他プロセスへの防御を強めたい場合は `BASE_FREE_MB` を下げます。
+- GPU が混雑しているときに早く失敗させたい場合は `WAIT_TIMEOUT_SEC` を下げます。
+- 実行履歴から target を学習させたい場合は `PROFILE_ENABLE` を有効化します。

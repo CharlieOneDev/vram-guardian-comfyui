@@ -1,77 +1,84 @@
-# VRAM Guardian for ComfyUI
+# ComfyUI VRAM Guardian
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-这是一个实验性的 sidecar，用于预留 CUDA 显存，并在 ComfyUI 遇到 OOM 时释放显存给它重试。
+VRAM Guardian for ComfyUI 是一个实验性的显存保留与调度工具，适合多人共享 NVIDIA GPU 的环境。
 
-英文版 README 是主文档；这个中文版本用于快速理解和安装。
+它由两部分组成：一个 Guardian 进程负责预占 CUDA 显存，一个 ComfyUI 插件负责在工作流和节点执行阶段通知 Guardian 释放、等待或回填显存。目标是在尽量防止其他进程抢占显存的同时，给 ComfyUI 的重节点保留突发申请空间。
 
-这不是一个真正的私有显存池。它只能让其他进程更难提前抢走空闲显存，并在 Guardian 释放持有的 tensor 后，给 ComfyUI 一次或多次重试机会。
+## 核心能力
+
+- Guardian 通过 CUDA tensor 预占显存。
+- ComfyUI 插件 monkey-patch 执行流程，在节点执行前做显存调度。
+- 普通阶段维持较低空闲显存，减少被其他进程抢走的窗口。
+- 重节点执行前提高目标空闲显存，并等待 Guardian 释放到位。
+- 重节点执行中保持高水位，避免中途回填过猛导致后半段 OOM。
+- 节点结束后恢复基础水位并回填。
+- OOM 后全释放、清理 CUDA cache、重试一次，并可提高该节点下次预算。
+- 可选本地 profiling，记录节点显存行为。
+
+## 重要限制
+
+这个工具不能创建 ComfyUI 私有显存池。Guardian 释放的显存会回到 CUDA driver，其他进程仍然可能抢走。
+
+插件可以做到：
+
+- 节点开始前释放和等待；
+- 节点运行中维持水位；
+- 节点结束后回填；
+- OOM 后释放和重试。
+
+插件很难做到：
+
+- 拦截任意底层 `cudaMalloc` 的瞬间申请；
+- 在其他进程已经占满显存时强制拿回显存；
+- 让超出 GPU 总显存的工作流成功运行。
 
 ## 项目结构
 
-- `guardian/`: TCP 服务，通过分配 CUDA tensor 来占用显存。
-- `comfyui_plugin/`: ComfyUI `custom_nodes` 插件，用于 patch `execution.get_output_data`。
-- `docker-compose.yml`: Linux/NVIDIA Docker sidecar 服务。
-- `scripts/`: 将插件复制到 ComfyUI 的辅助脚本。
+```text
+guardian/                       Guardian TCP 服务端和 CLI 客户端
+comfyui_plugin/vram_guardian_comfyui/
+                                ComfyUI custom_nodes 插件
+scripts/                        安装插件和直接运行 Guardian 的脚本
+docker-compose.yml              可选 Docker sidecar 启动方式
+Dockerfile                      可选 Guardian 容器镜像
+```
 
-## 运行 Guardian sidecar
+## 启动 Guardian
 
-前提条件：
+根据环境选择一种方式。
 
-- 宿主机能看到 NVIDIA GPU。用 `nvidia-smi` 检查。
-- 已安装 Docker 和 Docker Compose。用 `docker --version` 和 `docker compose version` 检查。
-- Docker 能访问 GPU。用下面的命令检查：
+### 方式 A：Docker Compose Sidecar
+
+适合 Docker 可以直接访问 NVIDIA GPU 的环境。
+
+检查前提：
 
 ```bash
+nvidia-smi
+docker --version
+docker compose version
 docker run --rm --gpus all ubuntu nvidia-smi
 ```
 
-如果这个命令能打印 `nvidia-smi` 的 GPU 表格，说明 Docker 可以使用 GPU，这个项目就可以跑。如果失败，需要先修 Docker GPU 访问，再启动 Guardian。
-
-Windows 上建议使用 Docker Desktop，并启用 WSL2 backend。Docker 官方文档说明，Docker Desktop for Windows 的 GPU 支持依赖 WSL2 backend；Docker Engine 文档也说明了用 `--gpus` 把 NVIDIA GPU 暴露给容器。原生 Linux 上需要安装并配置 NVIDIA Container Toolkit。参考：
-
-- Docker GPU access: <https://docs.docker.com/engine/containers/gpu/>
-- Docker Desktop GPU support: <https://docs.docker.com/desktop/features/gpu/>
-- NVIDIA Container Toolkit 安装文档: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
-- NVIDIA sample workload 检查: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/sample-workload.html>
-
-如果 Linux 里还没安装 NVIDIA Container Toolkit，按 NVIDIA 官方安装文档安装后，通常还需要执行：
-
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-sudo systemctl restart docker
-docker run --rm --gpus all ubuntu nvidia-smi
-```
-
-`/path/to/vram-guardian-comfyui` 的意思是“这个仓库所在目录”，也就是包含本 README 和 `docker-compose.yml` 的那个目录。
-
-如果你还没有拉取仓库，先执行：
+如果最后一条命令能打印 GPU 表格，就可以使用 Docker/Compose 模式。
 
 ```bash
 git clone https://github.com/CharlieOneDev/vram-guardian-comfyui.git
 cd vram-guardian-comfyui
-```
-
-如果你使用的是我之前创建在 `G:\codex` 下面的本地目录，在 Windows PowerShell 里是：
-
-```powershell
-cd G:\codex\vram-guardian-comfyui
-```
-
-如果你在 WSL 终端里访问同一个 Windows 盘符，通常是：
-
-```bash
-cd /mnt/g/codex/vram-guardian-comfyui
-```
-
-然后启动 Guardian：
-
-```bash
 docker compose up -d --build
 ```
 
-如果你的 Compose 实现不认识 GPU 字段，报类似 `Additional property gpus is not allowed`，说明 Docker 本身可能能用 GPU，但 compose 文件的 GPU 语法太新。可以改用下面这个直接 Docker 启动方式：
+查看状态：
+
+```bash
+docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1 --port 8765
+```
+
+如果 Compose 报 `Additional property gpus is not allowed`，说明当前 Compose 对 GPU 字段支持不足，可以改用直接 Docker 或直接 Python 模式。
+
+### 方式 B：直接 Docker
 
 ```bash
 docker build -t vram-guardian-comfyui:local .
@@ -85,23 +92,22 @@ docker run -d \
   -e VRAM_GUARDIAN_PORT=8765 \
   -e VRAM_GUARDIAN_DEVICE=cuda:0 \
   -e VRAM_GUARDIAN_FRACTION=0.82 \
-  -e VRAM_GUARDIAN_MIN_FREE_MB=1536 \
-  -e VRAM_GUARDIAN_CHUNK_MB=256 \
-  -e VRAM_GUARDIAN_MAX_HOLD_MB=0 \
-  -e VRAM_GUARDIAN_AUTO_REFILL=true \
-  -e VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC=5 \
-  -e VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB=256 \
   vram-guardian-comfyui:local
 ```
 
-如果直接 Docker 启动也在 NVIDIA runtime 初始化阶段失败，并出现类似 `/proc/driver/nvidia/gpus/... no such file or directory`，说明当前 CNB/嵌套 Docker 环境不适合再套一层 GPU 容器。这时改用 direct 模式：直接在当前 Linux/CNB/WSL 环境里跑 Guardian 进程。
+如果 Docker 在 NVIDIA runtime 初始化阶段失败，建议使用直接 Python 模式。
+
+### 方式 C：直接 Python
+
+适合 CNB、WSL2、云容器或无法嵌套 GPU Docker 的环境。
 
 ```bash
+cd vram-guardian-comfyui
 python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
 
-direct 模式会把日志写到 `vram_guardian.log`，PID 写到 `vram_guardian.pid`。默认会启用 auto-refill，所以 Guardian 会定期检查新释放出来的显存，并尽量补占回配置目标。
+常用命令：
 
 ```bash
 bash scripts/guardian_direct.sh status
@@ -109,113 +115,149 @@ bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
 
-实时日志会显示一行显存摘要：
+直接模式会生成：
 
 ```text
-total=45458MiB free=1536MiB guardian_held=32656MiB target=39086MiB external_calc=11266MiB guardian_proc=33126MiB comfyui=2048MiB other=9218MiB paused=0s
+vram_guardian.log
+vram_guardian.pid
 ```
-
-Docker 或 Compose 模式用下面的命令查看状态：
-
-```bash
-docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1 --port 8765
-```
-
-常用环境变量：
-
-- `VRAM_GUARDIAN_FRACTION`: 目标占用的 GPU 总显存比例。默认：`0.82`。
-- `VRAM_GUARDIAN_MIN_FREE_MB`: 填充显存时保留的空闲显存。默认：`1536`。
-- `VRAM_GUARDIAN_CHUNK_MB`: 分配粒度。默认：`256`。
-- `VRAM_GUARDIAN_MAX_HOLD_MB`: 绝对占用上限，`0` 表示不设置上限。
-- `VRAM_GUARDIAN_DEVICE`: CUDA 设备。默认：`cuda:0`。
-- `VRAM_GUARDIAN_AUTO_REFILL`: 定期自动补占新释放出来的显存。默认：`true`。
-- `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: 自动补占检查间隔。默认：`5`。
-- `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: 至少多出多少可占用显存才触发自动补占。默认：`256`。
-- `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI 插件在每个节点执行前先释放 Guardian。默认：`false`。
-- `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 后暂停 auto-refill，给 ComfyUI 留出分配时间。默认：`3600`。
-- `VRAM_GUARDIAN_COMFYUI_PID`: 可选，用于自动识别不准时，指定 ComfyUI PID 以便日志区分 ComfyUI 显存。
-- `VRAM_GUARDIAN_ACTIVE_FREE_MB`: 插件在当前作用范围运行期间开启 Guardian watermark 模式，并维持这么多空闲显存。默认：`0`，表示关闭。
-- `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: 空闲显存超过目标多少后，Guardian 才补占多余部分。默认：`2048`。
-- `VRAM_GUARDIAN_ACTIVE_SCOPE`: active watermark 的作用范围。`prompt` 表示整个 ComfyUI 工作流，`node` 表示指定节点。默认：`prompt`。
-- `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class 名称，只在 `ACTIVE_SCOPE=node` 时使用。为空时，node scope 下对所有节点生效。
-- `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: Guardian 在 watermark 模式下的检查间隔。默认：`1`。
-- `VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC`: watermark 释放后，Guardian 等多久再考虑补占。默认：`5`。
 
 ## 安装 ComfyUI 插件
 
-将 `comfyui_plugin/vram_guardian_comfyui` 复制到 ComfyUI 的 `custom_nodes` 目录。
+把插件复制到 ComfyUI 的 `custom_nodes` 目录。
 
 Linux：
 
 ```bash
+cd vram-guardian-comfyui
 ./scripts/install_plugin.sh /path/to/ComfyUI/custom_nodes
 ```
 
 Windows PowerShell：
 
 ```powershell
-.\scripts\install_plugin.ps1 -ComfyUICustomNodes "F:\path\to\ComfyUI\custom_nodes"
+cd vram-guardian-comfyui
+.\scripts\install_plugin.ps1 -ComfyUICustomNodes "D:\path\to\ComfyUI\custom_nodes"
 ```
 
-然后用以下环境变量启动 ComfyUI：
+安装或更新插件后，需要重启 ComfyUI。
+
+## 推荐 Scheduler 配置
+
+48GB 共享 GPU 可以从下面配置开始：
 
 ```bash
-VRAM_GUARDIAN_HOST=127.0.0.1 \
-VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_MAX_RETRY=1 \
+export VRAM_GUARDIAN_HOST=127.0.0.1
+export VRAM_GUARDIAN_PORT=8765
+export VRAM_GUARDIAN_MAX_RETRY=1
+
+export VRAM_GUARDIAN_SCHEDULER_ENABLE=true
+export VRAM_GUARDIAN_BASE_FREE_MB=6144
+export VRAM_GUARDIAN_HEAVY_FREE_MB=20480
+export VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=1024
+export VRAM_GUARDIAN_WAIT_TIMEOUT_SEC=120
+export VRAM_GUARDIAN_WAIT_POLL_SEC=0.5
+export VRAM_GUARDIAN_MONITOR_INTERVAL_SEC=0.5
+export VRAM_GUARDIAN_OOM_BUMP_MB=4096
+
+export VRAM_GUARDIAN_NODE_FREE_MAP='{
+  "KSampler": 24576,
+  "VAEDecode": 16384,
+  "VAEDecodeTiled": 12288,
+  "UltimateSDUpscale": 24576,
+  "SegmentVSRFIStreamRunner": 24576,
+  "WanVideoSampler": 24576,
+  "LTXVideoSampler": 24576
+}'
+
+export VRAM_GUARDIAN_PROFILE_ENABLE=true
+export VRAM_GUARDIAN_PROFILE_PATH=./vram_guardian_profile.json
+export VRAM_GUARDIAN_PROFILE_MARGIN_MB=2048
+
 python main.py
 ```
 
-如果你的工作流一开始就需要大量显存，不想等第一次 OOM 后再释放，可以让插件在每个节点执行前先释放 Guardian：
+PowerShell 示例：
 
-```bash
-VRAM_GUARDIAN_HOST=127.0.0.1 \
-VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_MAX_RETRY=1 \
-VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
-VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
+```powershell
+$env:VRAM_GUARDIAN_HOST = "127.0.0.1"
+$env:VRAM_GUARDIAN_PORT = "8765"
+$env:VRAM_GUARDIAN_SCHEDULER_ENABLE = "true"
+$env:VRAM_GUARDIAN_BASE_FREE_MB = "6144"
+$env:VRAM_GUARDIAN_HEAVY_FREE_MB = "20480"
+$env:VRAM_GUARDIAN_NODE_FREE_MAP = '{"KSampler":24576,"VAEDecode":16384}'
 python main.py
 ```
 
-对于通用 ComfyUI 工作流，更推荐 prompt-scope active watermark 模式。Guardian 会在整个工作流执行期间维持一段目标空闲显存，同时继续占住多余显存作为防抢占保护：
+## Scheduler 工作流程
 
-```bash
-VRAM_GUARDIAN_HOST=127.0.0.1 \
-VRAM_GUARDIAN_PORT=8765 \
-VRAM_GUARDIAN_ACTIVE_SCOPE=prompt \
-VRAM_GUARDIAN_ACTIVE_FREE_MB=20480 \
-VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB=2048 \
-VRAM_GUARDIAN_RELEASE_BEFORE_NODE=0 \
-VRAM_GUARDIAN_RECLAIM_ON_SUCCESS=1 \
-python main.py
+1. ComfyUI 开始执行 prompt 时，插件开启 base watermark。
+2. 普通节点使用 `BASE_FREE_MB` 作为基础空闲显存目标。
+3. 如果节点 class 命中 `NODE_FREE_MAP`，插件会把目标 free 提高到对应值。
+4. 如果节点 class 在 `HEAVY_NODES` 中但没有 map，则使用 `HEAVY_FREE_MB`。
+5. 节点执行前，插件调用 Guardian 的 `ensure_free`，让 Guardian 释放到目标 free。
+6. 如果 free 不够，插件会等待，并周期性打印日志。
+7. 节点运行中，Guardian 保持该节点目标水位。
+8. 节点完成后，高水位 token 关闭，Guardian 回到 base 水位。
+9. prompt 结束后，Guardian 回到正常防抢占状态。
+
+## 环境变量
+
+Guardian 进程：
+
+- `VRAM_GUARDIAN_FRACTION`: Guardian 目标占用比例，默认 `0.82`。
+- `VRAM_GUARDIAN_MIN_FREE_MB`: 普通回填时保留的空闲显存，默认 `1536`。
+- `VRAM_GUARDIAN_CHUNK_MB`: 分配粒度，默认 `256`。
+- `VRAM_GUARDIAN_MAX_HOLD_MB`: 绝对占用上限，`0` 表示不限制。
+- `VRAM_GUARDIAN_DEVICE`: CUDA 设备，默认 `cuda:0`。
+- `VRAM_GUARDIAN_AUTO_REFILL`: 是否启用控制循环，默认 `true`。
+- `VRAM_GUARDIAN_WATERMARK_INTERVAL_SEC`: watermark 模式检查间隔，默认 `1`。
+- `VRAM_GUARDIAN_WATERMARK_RELEASE_COOLDOWN_SEC`: watermark 释放后多久再补占，默认 `5`。
+
+ComfyUI 插件：
+
+- `VRAM_GUARDIAN_SCHEDULER_ENABLE`: 启用 Scheduler。
+- `VRAM_GUARDIAN_BASE_FREE_MB`: 普通阶段目标空闲显存。
+- `VRAM_GUARDIAN_HEAVY_FREE_MB`: 未单独配置的重节点目标空闲显存。
+- `VRAM_GUARDIAN_NODE_FREE_MAP`: 节点 class 到目标 free 的 JSON 映射。
+- `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class。
+- `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: 高水位回填缓冲区。
+- `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: 节点开始前最长等待时间，`0` 表示无限等待。
+- `VRAM_GUARDIAN_WAIT_POLL_SEC`: 等待轮询间隔。
+- `VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC`: 等待日志间隔。
+- `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: 节点运行期间采样间隔。
+- `VRAM_GUARDIAN_PROFILE_ENABLE`: 启用本地 profile。
+- `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON 路径，默认 `vram_guardian_profile.json`。
+- `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: profile 学习结果额外安全边距。
+- `VRAM_GUARDIAN_OOM_BUMP_MB`: OOM 后下次目标提高量。
+- `VRAM_GUARDIAN_MAX_RETRY`: OOM 后重试次数，默认 `1`。
+
+## 日志验证
+
+Guardian 日志会显示总显存、空闲显存、Guardian 占用、ComfyUI 占用和其他进程占用：
+
+```text
+total=45458MiB free=6144MiB guardian_held=32768MiB target=40960MiB external_calc=6546MiB guardian_proc=33024MiB comfyui=2048MiB other=4498MiB paused=0s
 ```
 
-这个模式下，插件会为当前作用范围开启带 token 的 watermark 会话。空闲显存低于 `ACTIVE_FREE_MB` 时，Guardian 会动态释放 chunk；释放后会等待一个短冷却；只有空闲显存高于 `ACTIVE_FREE_MB + ACTIVE_HYSTERESIS_MB` 时，Guardian 才会在保留这段空闲显存的前提下补占多余部分。如果节点 OOM 后重试，重试会使用全释放状态，不会重新开启 watermark 补占。
+Scheduler 日志示例：
 
-`ACTIVE_FREE_MB` 要按这个工作流或节点可能出现的最大瞬时显存申请来设。后台监控不能阻止“单次申请量大于当前空闲显存”的 OOM，所以长视频场景不要把这个值设得太低。
-
-如果只想针对某些节点微调，可以设置 `VRAM_GUARDIAN_ACTIVE_SCOPE=node`，再按需设置 `VRAM_GUARDIAN_HEAVY_NODES=SegmentVSRFIStreamRunner`。
-
-如果 ComfyUI 运行在同一个 compose 网络里的另一个 Docker 容器中，设置：
-
-```bash
-VRAM_GUARDIAN_HOST=guardian
+```text
+[VRAM Scheduler] node=KSampler#12 class=KSampler target_free=24576MiB source=node-map
+[VRAM Scheduler] KSampler#12 waiting: free=8192MiB target=24576MiB guardian_held=16384MiB
+[VRAM Scheduler] KSampler#12 free reached 24600MiB target=24576MiB; continuing
 ```
 
-## 工作方式
+如果 Guardian 已经释放完但 free 仍然不足，说明可能有外部进程占用：
 
-1. Guardian 分配 CUDA byte tensor，直到达到配置的目标占用。
-2. ComfyUI 插件捕获来自 `execution.get_output_data` 的 CUDA OOM。
-3. 插件通知 Guardian 释放显存。
-4. 插件清理 ComfyUI 进程内的 CUDA cache，然后重试节点。
-5. 节点成功后，插件通知 Guardian 重新占回显存。
+```text
+[VRAM Scheduler] KSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
+```
 
-## 重要限制
+## 调参建议
 
-- 释放的显存会回到 CUDA driver，不会定向分配给 ComfyUI；其他进程仍可能抢先拿走。
-- OOM 后重试节点不一定适用于所有自定义节点，因为某些节点可能有副作用。
-- 深层异步任务中的 OOM 可能只能触发释放并重新抛出，不能完整重试。
-- 共享 GPU 平台可能会杀掉或限制故意长期占用大量显存的进程。
-- 如果 ComfyUI 工作流本身真的超过 GPU 总显存，这个工具无法解决。
-
-建议从保守配置开始，例如 `VRAM_GUARDIAN_FRACTION=0.65`，测试稳定后再提高。
+- 普通节点 OOM：提高 `BASE_FREE_MB`。
+- 某个重节点 OOM：提高 `NODE_FREE_MAP` 中该节点的值。
+- 防抢占不够强：降低 `BASE_FREE_MB` 或提高 `VRAM_GUARDIAN_FRACTION`。
+- 不想长时间等待：降低 `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`。
+- 想让配置越跑越准：启用 `VRAM_GUARDIAN_PROFILE_ENABLE`。

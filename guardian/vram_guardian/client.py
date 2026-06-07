@@ -23,7 +23,7 @@ def request(host: str, port: int, payload: dict, timeout: float = 3.0) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="VRAM Guardian control client")
-    parser.add_argument("cmd", choices=["ping", "status", "release", "reclaim", "fill", "set_watermark"])
+    parser.add_argument("cmd", choices=["ping", "status", "release", "reclaim", "fill", "ensure_free", "set_watermark"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=8765, type=int)
     parser.add_argument("--mb", default=0, type=int, help="amount to release, 0 means all")
@@ -38,8 +38,10 @@ def main() -> int:
     payload = {"cmd": args.cmd}
     if args.cmd == "release" and args.mb > 0:
         payload["mb"] = args.mb
-    if args.cmd == "release" and args.pause_refill_sec > 0:
+    if args.cmd in {"release", "ensure_free"} and args.pause_refill_sec > 0:
         payload["pause_refill_sec"] = args.pause_refill_sec
+    if args.cmd == "ensure_free":
+        payload["free_mb"] = args.free_mb or args.mb
     if args.cmd == "set_watermark":
         if args.mode is not None:
             payload["mode"] = args.mode
