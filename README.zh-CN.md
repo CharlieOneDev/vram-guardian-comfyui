@@ -88,6 +88,9 @@ docker run -d \
   -e VRAM_GUARDIAN_MIN_FREE_MB=1536 \
   -e VRAM_GUARDIAN_CHUNK_MB=256 \
   -e VRAM_GUARDIAN_MAX_HOLD_MB=0 \
+  -e VRAM_GUARDIAN_AUTO_REFILL=true \
+  -e VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC=5 \
+  -e VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB=256 \
   vram-guardian-comfyui:local
 ```
 
@@ -98,7 +101,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
 
-direct 模式会把日志写到 `vram_guardian.log`，PID 写到 `vram_guardian.pid`。
+direct 模式会把日志写到 `vram_guardian.log`，PID 写到 `vram_guardian.pid`。默认会启用 auto-refill，所以 Guardian 会定期检查新释放出来的显存，并尽量补占回配置目标。
 
 ```bash
 bash scripts/guardian_direct.sh status
@@ -119,6 +122,9 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_CHUNK_MB`: 分配粒度。默认：`256`。
 - `VRAM_GUARDIAN_MAX_HOLD_MB`: 绝对占用上限，`0` 表示不设置上限。
 - `VRAM_GUARDIAN_DEVICE`: CUDA 设备。默认：`cuda:0`。
+- `VRAM_GUARDIAN_AUTO_REFILL`: 定期自动补占新释放出来的显存。默认：`true`。
+- `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: 自动补占检查间隔。默认：`5`。
+- `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: 至少多出多少可占用显存才触发自动补占。默认：`256`。
 
 ## 安装 ComfyUI 插件
 

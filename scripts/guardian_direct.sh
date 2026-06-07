@@ -13,6 +13,9 @@ FRACTION="${VRAM_GUARDIAN_FRACTION:-0.82}"
 MIN_FREE_MB="${VRAM_GUARDIAN_MIN_FREE_MB:-1536}"
 CHUNK_MB="${VRAM_GUARDIAN_CHUNK_MB:-256}"
 MAX_HOLD_MB="${VRAM_GUARDIAN_MAX_HOLD_MB:-0}"
+AUTO_REFILL="${VRAM_GUARDIAN_AUTO_REFILL:-true}"
+AUTO_REFILL_INTERVAL_SEC="${VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC:-5}"
+AUTO_REFILL_MIN_DELTA_MB="${VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB:-256}"
 LOG_FILE="${VRAM_GUARDIAN_LOG_FILE:-${ROOT_DIR}/vram_guardian.log}"
 PID_FILE="${VRAM_GUARDIAN_PID_FILE:-${ROOT_DIR}/vram_guardian.pid}"
 
@@ -51,6 +54,9 @@ case "${COMMAND}" in
       --min-free-mb "${MIN_FREE_MB}" \
       --chunk-mb "${CHUNK_MB}" \
       --max-hold-mb "${MAX_HOLD_MB}" \
+      --auto-refill "${AUTO_REFILL}" \
+      --auto-refill-interval-sec "${AUTO_REFILL_INTERVAL_SEC}" \
+      --auto-refill-min-delta-mb "${AUTO_REFILL_MIN_DELTA_MB}" \
       > "${LOG_FILE}" 2>&1 &
     echo "$!" > "${PID_FILE}"
     sleep 2

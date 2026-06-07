@@ -23,6 +23,9 @@ class GuardianConfig:
     min_free_mb: int = 1536
     chunk_mb: int = 256
     max_hold_mb: int = 0
+    auto_refill: bool = True
+    auto_refill_interval_sec: float = 5.0
+    auto_refill_min_delta_mb: int = 256
 
     @property
     def min_free_bytes(self) -> int:
@@ -36,6 +39,10 @@ class GuardianConfig:
     def max_hold_bytes(self) -> int:
         return max(0, self.max_hold_mb) * MIB
 
+    @property
+    def auto_refill_min_delta_bytes(self) -> int:
+        return max(16, self.auto_refill_min_delta_mb) * MIB
+
 
 class VramGuardian:
     def __init__(self, config: GuardianConfig) -> None:
@@ -48,6 +55,8 @@ class VramGuardian:
 
         self.lock = threading.RLock()
         self.chunks: list[torch.Tensor] = []
+        self.stop_event = threading.Event()
+        self.auto_refill_thread: threading.Thread | None = None
 
     def held_bytes_unlocked(self) -> int:
         return sum(chunk.numel() * chunk.element_size() for chunk in self.chunks)
@@ -103,6 +112,19 @@ class VramGuardian:
 
             return self.status_unlocked(extra={"allocated_bytes": allocated})
 
+    def maybe_refill(self) -> dict[str, Any]:
+        with self.lock:
+            held = self.held_bytes_unlocked()
+            free, _ = self.mem_info_unlocked()
+            target = self.target_bytes_unlocked()
+            remaining_to_target = target - held
+            available_to_take = free - self.config.min_free_bytes
+            if remaining_to_target < self.config.auto_refill_min_delta_bytes:
+                return self.status_unlocked(extra={"allocated_bytes": 0, "auto_refill_skipped": "target"})
+            if available_to_take < self.config.auto_refill_min_delta_bytes:
+                return self.status_unlocked(extra={"allocated_bytes": 0, "auto_refill_skipped": "free"})
+        return self.fill()
+
     def release(self, bytes_to_release: int = 0) -> dict[str, Any]:
         with self.lock:
             released = 0
@@ -124,6 +146,32 @@ class VramGuardian:
 
             return self.status_unlocked(extra={"released_bytes": released})
 
+    def start_auto_refill(self) -> None:
+        if not self.config.auto_refill or self.auto_refill_thread is not None:
+            return
+        self.auto_refill_thread = threading.Thread(target=self._auto_refill_loop, name="vram-auto-refill", daemon=True)
+        self.auto_refill_thread.start()
+        LOG.info(
+            "auto refill enabled: interval=%ss min_delta=%s MiB",
+            self.config.auto_refill_interval_sec,
+            self.config.auto_refill_min_delta_mb,
+        )
+
+    def stop_auto_refill(self) -> None:
+        self.stop_event.set()
+        if self.auto_refill_thread is not None:
+            self.auto_refill_thread.join(timeout=max(1.0, self.config.auto_refill_interval_sec))
+
+    def _auto_refill_loop(self) -> None:
+        while not self.stop_event.wait(max(0.5, self.config.auto_refill_interval_sec)):
+            try:
+                status = self.maybe_refill()
+                allocated = int(status.get("allocated_bytes", 0) or 0)
+                if allocated > 0:
+                    LOG.info("auto refill allocated %.2f MiB", allocated / MIB)
+            except Exception:
+                LOG.exception("auto refill failed")
+
     def set_fraction(self, fraction: float) -> dict[str, Any]:
         with self.lock:
             self.config.fraction = max(0.0, min(0.98, fraction))
@@ -140,6 +188,9 @@ class VramGuardian:
             "chunk_mb": self.config.chunk_mb,
             "min_free_mb": self.config.min_free_mb,
             "max_hold_mb": self.config.max_hold_mb,
+            "auto_refill": self.config.auto_refill,
+            "auto_refill_interval_sec": self.config.auto_refill_interval_sec,
+            "auto_refill_min_delta_mb": self.config.auto_refill_min_delta_mb,
             "chunks": len(self.chunks),
             "held_bytes": held,
             "held_mb": round(held / MIB, 2),
@@ -220,6 +271,13 @@ def env_int(name: str, default: int) -> int:
     return default if value is None or value == "" else int(value)
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Reserve CUDA VRAM and release it on demand")
     parser.add_argument("--host", default=os.getenv("VRAM_GUARDIAN_HOST", "0.0.0.0"))
@@ -229,8 +287,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-free-mb", default=env_int("VRAM_GUARDIAN_MIN_FREE_MB", 1536), type=int)
     parser.add_argument("--chunk-mb", default=env_int("VRAM_GUARDIAN_CHUNK_MB", 256), type=int)
     parser.add_argument("--max-hold-mb", default=env_int("VRAM_GUARDIAN_MAX_HOLD_MB", 0), type=int)
+    parser.add_argument("--auto-refill", default=env_bool("VRAM_GUARDIAN_AUTO_REFILL", True), type=env_bool_arg)
+    parser.add_argument(
+        "--auto-refill-interval-sec",
+        default=env_float("VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC", 5.0),
+        type=float,
+    )
+    parser.add_argument(
+        "--auto-refill-min-delta-mb",
+        default=env_int("VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB", 256),
+        type=int,
+    )
     parser.add_argument("--log-level", default=os.getenv("VRAM_GUARDIAN_LOG_LEVEL", "INFO"))
     return parser
+
+
+def env_bool_arg(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def main() -> int:
@@ -244,9 +319,13 @@ def main() -> int:
             min_free_mb=args.min_free_mb,
             chunk_mb=args.chunk_mb,
             max_hold_mb=args.max_hold_mb,
+            auto_refill=args.auto_refill,
+            auto_refill_interval_sec=args.auto_refill_interval_sec,
+            auto_refill_min_delta_mb=args.auto_refill_min_delta_mb,
         )
     )
     LOG.info("initial fill: %s", guardian.fill())
+    guardian.start_auto_refill()
 
     server = GuardianTCPServer((args.host, args.port), guardian)
     LOG.info("listening on %s:%s", args.host, args.port)
@@ -254,8 +333,10 @@ def main() -> int:
         server.serve_forever()
     except KeyboardInterrupt:
         LOG.info("stopping; releasing held VRAM")
+        guardian.stop_auto_refill()
         guardian.release()
     finally:
+        guardian.stop_auto_refill()
         server.server_close()
     return 0
 

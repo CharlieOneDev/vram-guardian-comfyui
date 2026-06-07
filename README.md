@@ -84,6 +84,9 @@ docker run -d \
   -e VRAM_GUARDIAN_MIN_FREE_MB=1536 \
   -e VRAM_GUARDIAN_CHUNK_MB=256 \
   -e VRAM_GUARDIAN_MAX_HOLD_MB=0 \
+  -e VRAM_GUARDIAN_AUTO_REFILL=true \
+  -e VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC=5 \
+  -e VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB=256 \
   vram-guardian-comfyui:local
 ```
 
@@ -94,7 +97,7 @@ python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
 
-Direct mode writes logs to `vram_guardian.log` and a PID file to `vram_guardian.pid`.
+Direct mode writes logs to `vram_guardian.log` and a PID file to `vram_guardian.pid`. Auto-refill is enabled by default, so Guardian periodically checks for newly free VRAM and fills it back up to the configured target.
 
 ```bash
 bash scripts/guardian_direct.sh status
@@ -115,6 +118,9 @@ Useful environment variables:
 - `VRAM_GUARDIAN_CHUNK_MB`: allocation granularity. Default: `256`.
 - `VRAM_GUARDIAN_MAX_HOLD_MB`: absolute cap, `0` means no cap.
 - `VRAM_GUARDIAN_DEVICE`: CUDA device. Default: `cuda:0`.
+- `VRAM_GUARDIAN_AUTO_REFILL`: periodically reclaim newly free VRAM. Default: `true`.
+- `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: auto-refill interval. Default: `5`.
+- `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: minimum newly available amount before auto-refill allocates. Default: `256`.
 
 ## Install the ComfyUI plugin
 
