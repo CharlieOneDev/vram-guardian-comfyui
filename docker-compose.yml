@@ -1,0 +1,22 @@
+name: vram-guardian-comfyui
+
+services:
+  guardian:
+    build:
+      context: .
+      args:
+        BASE_IMAGE: ${VRAM_GUARDIAN_BASE_IMAGE:-pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime}
+    image: vram-guardian-comfyui:local
+    container_name: vram-guardian
+    restart: unless-stopped
+    gpus: all
+    ports:
+      - "127.0.0.1:${VRAM_GUARDIAN_PORT:-8765}:8765"
+    environment:
+      VRAM_GUARDIAN_HOST: "0.0.0.0"
+      VRAM_GUARDIAN_PORT: "8765"
+      VRAM_GUARDIAN_DEVICE: "${VRAM_GUARDIAN_DEVICE:-cuda:0}"
+      VRAM_GUARDIAN_FRACTION: "${VRAM_GUARDIAN_FRACTION:-0.82}"
+      VRAM_GUARDIAN_MIN_FREE_MB: "${VRAM_GUARDIAN_MIN_FREE_MB:-1536}"
+      VRAM_GUARDIAN_CHUNK_MB: "${VRAM_GUARDIAN_CHUNK_MB:-256}"
+      VRAM_GUARDIAN_MAX_HOLD_MB: "${VRAM_GUARDIAN_MAX_HOLD_MB:-0}"
