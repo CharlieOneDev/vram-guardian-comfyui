@@ -40,6 +40,8 @@ PORT = _env_int("VRAM_GUARDIAN_PORT", 8765)
 TIMEOUT = _env_float("VRAM_GUARDIAN_TIMEOUT_SEC", 2.0)
 MAX_RETRY = _env_int("VRAM_GUARDIAN_MAX_RETRY", 1)
 RELEASE_MB = _env_int("VRAM_GUARDIAN_RELEASE_MB", 0)
+RELEASE_REFILL_PAUSE = _env_float("VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC", 3600.0)
+RELEASE_BEFORE_NODE = _env_bool("VRAM_GUARDIAN_RELEASE_BEFORE_NODE", False)
 RETRY_SLEEP = _env_float("VRAM_GUARDIAN_RETRY_SLEEP_SEC", 0.5)
 RECLAIM_ON_SUCCESS = _env_bool("VRAM_GUARDIAN_RECLAIM_ON_SUCCESS", True)
 RECLAIM_DELAY = _env_float("VRAM_GUARDIAN_RECLAIM_DELAY_SEC", 0.0)
@@ -60,7 +62,7 @@ def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
 
 
 def _release_guardian() -> None:
-    fields: dict[str, Any] = {}
+    fields: dict[str, Any] = {"pause_refill_sec": RELEASE_REFILL_PAUSE}
     if RELEASE_MB > 0:
         fields["mb"] = RELEASE_MB
     response = _guardian_request("release", **fields)
@@ -122,6 +124,11 @@ def _install_get_output_data_patch() -> None:
             label = _node_label(args, kwargs)
             for attempt in range(MAX_RETRY + 1):
                 try:
+                    if RELEASE_BEFORE_NODE and attempt == 0:
+                        LOG.info("releasing Guardian VRAM before node %s", label)
+                        _release_guardian()
+                        _local_cuda_cleanup()
+                        await _async_sleep()
                     result = await original(*args, **kwargs)
                     if RECLAIM_ON_SUCCESS:
                         _reclaim_guardian()
@@ -149,6 +156,12 @@ def _install_get_output_data_patch() -> None:
         label = _node_label(args, kwargs)
         for attempt in range(MAX_RETRY + 1):
             try:
+                if RELEASE_BEFORE_NODE and attempt == 0:
+                    LOG.info("releasing Guardian VRAM before node %s", label)
+                    _release_guardian()
+                    _local_cuda_cleanup()
+                    if RETRY_SLEEP > 0:
+                        time.sleep(RETRY_SLEEP)
                 result = original(*args, **kwargs)
                 if RECLAIM_ON_SUCCESS:
                     _reclaim_guardian()

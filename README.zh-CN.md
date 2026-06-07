@@ -125,6 +125,8 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_AUTO_REFILL`: 定期自动补占新释放出来的显存。默认：`true`。
 - `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: 自动补占检查间隔。默认：`5`。
 - `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: 至少多出多少可占用显存才触发自动补占。默认：`256`。
+- `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI 插件在每个节点执行前先释放 Guardian。默认：`false`。
+- `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 后暂停 auto-refill，给 ComfyUI 留出分配时间。默认：`3600`。
 
 ## 安装 ComfyUI 插件
 
@@ -148,6 +150,17 @@ Windows PowerShell：
 VRAM_GUARDIAN_HOST=127.0.0.1 \
 VRAM_GUARDIAN_PORT=8765 \
 VRAM_GUARDIAN_MAX_RETRY=1 \
+python main.py
+```
+
+如果你的工作流一开始就需要大量显存，不想等第一次 OOM 后再释放，可以让插件在每个节点执行前先释放 Guardian：
+
+```bash
+VRAM_GUARDIAN_HOST=127.0.0.1 \
+VRAM_GUARDIAN_PORT=8765 \
+VRAM_GUARDIAN_MAX_RETRY=1 \
+VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
+VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
 

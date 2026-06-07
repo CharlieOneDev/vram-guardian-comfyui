@@ -121,6 +121,8 @@ Useful environment variables:
 - `VRAM_GUARDIAN_AUTO_REFILL`: periodically reclaim newly free VRAM. Default: `true`.
 - `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: auto-refill interval. Default: `5`.
 - `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: minimum newly available amount before auto-refill allocates. Default: `256`.
+- `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin releases Guardian before each node. Default: `false`.
+- `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: pause auto-refill after release so ComfyUI can allocate. Default: `3600`.
 
 ## Install the ComfyUI plugin
 
@@ -144,6 +146,17 @@ Then start ComfyUI with:
 VRAM_GUARDIAN_HOST=127.0.0.1 \
 VRAM_GUARDIAN_PORT=8765 \
 VRAM_GUARDIAN_MAX_RETRY=1 \
+python main.py
+```
+
+For workflows that need a large amount of VRAM immediately, release Guardian before every node instead of waiting for the first OOM:
+
+```bash
+VRAM_GUARDIAN_HOST=127.0.0.1 \
+VRAM_GUARDIAN_PORT=8765 \
+VRAM_GUARDIAN_MAX_RETRY=1 \
+VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
+VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
 

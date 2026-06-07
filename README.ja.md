@@ -125,6 +125,8 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_AUTO_REFILL`: 新しく空いた VRAM を定期的に再確保します。デフォルト: `true`。
 - `VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC`: auto-refill の確認間隔。デフォルト: `5`。
 - `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: auto-refill が割り当てを始める最小増分。デフォルト: `256`。
+- `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin が各 node の実行前に Guardian を解放します。デフォルト: `false`。
+- `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 後に auto-refill を一時停止し、ComfyUI が割り当てる時間を確保します。デフォルト: `3600`。
 
 ## ComfyUI プラグインのインストール
 
@@ -148,6 +150,17 @@ Windows PowerShell:
 VRAM_GUARDIAN_HOST=127.0.0.1 \
 VRAM_GUARDIAN_PORT=8765 \
 VRAM_GUARDIAN_MAX_RETRY=1 \
+python main.py
+```
+
+Workflow が最初から大量の VRAM を必要とする場合は、最初の OOM を待たずに、各 node の実行前に Guardian を解放できます。
+
+```bash
+VRAM_GUARDIAN_HOST=127.0.0.1 \
+VRAM_GUARDIAN_PORT=8765 \
+VRAM_GUARDIAN_MAX_RETRY=1 \
+VRAM_GUARDIAN_RELEASE_BEFORE_NODE=1 \
+VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC=3600 \
 python main.py
 ```
 
