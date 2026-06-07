@@ -140,6 +140,8 @@ ESTIMATOR_MAX_FREE_MB = _env_int("VRAM_GUARDIAN_ESTIMATOR_MAX_FREE_MB", 0)
 HEAVY_REFILL_MODE = os.getenv("VRAM_GUARDIAN_HEAVY_REFILL_MODE", "no-refill").strip().lower()
 HEAVY_ALLOW_REFILL = HEAVY_REFILL_MODE in {"1", "true", "yes", "on", "refill", "fill"}
 OOM_BUMP_MB = _env_int("VRAM_GUARDIAN_OOM_BUMP_MB", 4096)
+OOM_RETRY_FREE_MB = _env_int("VRAM_GUARDIAN_OOM_RETRY_FREE_MB", 0)
+OOM_RETRY_RESERVE_MB = _env_int("VRAM_GUARDIAN_OOM_RETRY_RESERVE_MB", AUTO_FREE_RESERVE_MB)
 PROFILE_ENABLE = _env_bool("VRAM_GUARDIAN_PROFILE_ENABLE", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
 PROFILE_PATH = Path(os.getenv("VRAM_GUARDIAN_PROFILE_PATH", "vram_guardian_profile.json"))
 PROFILE_MARGIN_MB = _env_int("VRAM_GUARDIAN_PROFILE_MARGIN_MB", 2048)
@@ -892,6 +894,46 @@ def _wait_for_free_mb(label: str, target_free_mb: int) -> dict[str, Any] | None:
         status = _ensure_guardian_free(target_free_mb)
 
 
+def _oom_retry_target_mb(label: str, current_target_mb: int) -> int:
+    status = _guardian_status()
+    total_mb = _guardian_total_mb(status)
+    comfyui_mb = _status_comfyui_used_mb(status)
+    if OOM_RETRY_FREE_MB > 0:
+        requested = float(OOM_RETRY_FREE_MB)
+        source = "explicit"
+    else:
+        requested = float(max(current_target_mb + max(0, OOM_BUMP_MB), _heavy_free_target_mb(status)))
+        source = "auto"
+
+    cap = 0.0
+    if total_mb > 0:
+        cap = max(0.0, total_mb - max(0, OOM_RETRY_RESERVE_MB) - comfyui_mb)
+        requested = min(requested, cap)
+
+    target = _rounded_target_mb(requested)
+    LOG.info(
+        "[VRAM Scheduler] %s OOM retry target_free=%sMiB source=%s current_target=%sMiB "
+        "current_comfyui=%.0fMiB total=%.0fMiB cap=%.0fMiB reserve=%sMiB",
+        label,
+        target,
+        source,
+        current_target_mb,
+        comfyui_mb,
+        total_mb,
+        cap,
+        OOM_RETRY_RESERVE_MB,
+    )
+    return target
+
+
+def _prepare_oom_retry(label: str, current_target_mb: int) -> None:
+    _release_guardian()
+    _local_cuda_cleanup()
+    retry_target = _oom_retry_target_mb(label, current_target_mb)
+    if retry_target > 0:
+        _wait_for_free_mb(f"{label} OOM retry", retry_target)
+
+
 class SchedulerRun:
     def __init__(self, label: str, class_name: str, node_id: Any, target_free_mb: int, input_signature: dict[str, Any]) -> None:
         self.label = label
@@ -1189,9 +1231,8 @@ def _install_get_output_data_patch() -> None:
                         token = None
                     if _is_active_watermark_prompt():
                         _suspend_prompt_watermark(f"CUDA OOM in {label}")
-                    _release_guardian()
                     full_release_retry = True
-                    _local_cuda_cleanup()
+                    _prepare_oom_retry(label, target_free_mb)
                     await _async_sleep()
                 finally:
                     if run is not None and not profile_recorded:
@@ -1283,9 +1324,8 @@ def _install_get_output_data_patch() -> None:
                     token = None
                 if _is_active_watermark_prompt():
                     _suspend_prompt_watermark(f"CUDA OOM in {label}")
-                _release_guardian()
                 full_release_retry = True
-                _local_cuda_cleanup()
+                _prepare_oom_retry(label, target_free_mb)
                 if RETRY_SLEEP > 0:
                     time.sleep(RETRY_SLEEP)
             finally:

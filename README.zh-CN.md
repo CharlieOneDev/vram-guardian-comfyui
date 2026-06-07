@@ -14,7 +14,7 @@ VRAM Guardian for ComfyUI 是一个实验性的显存保留与调度工具，适
 - 重节点执行前提高目标空闲显存，并等待 Guardian 释放到位。
 - 重节点执行中保持高水位，避免中途回填过猛导致后半段 OOM。
 - 节点结束后恢复基础水位并回填。
-- OOM 后全释放、清理 CUDA cache、重试一次，并可提高该节点下次预算。
+- OOM 后全释放、清理 CUDA cache、等待更高的 retry 空闲显存目标、重试一次，并可提高该节点下次预算。
 - 可选本地 profiling，记录节点显存行为。
 
 ## 重要限制
@@ -33,6 +33,14 @@ VRAM Guardian for ComfyUI 是一个实验性的显存保留与调度工具，适
 - 拦截任意底层 `cudaMalloc` 的瞬间申请；
 - 在其他进程已经占满显存时强制拿回显存；
 - 让超出 GPU 总显存的工作流成功运行。
+
+## 容错模型
+
+VRAM Guardian 分三层处理故障：
+
+1. 预防：估算节点突发显存目标，在节点开始前释放，并在重节点运行期间保持 no-refill lease。
+2. 同进程 OOM retry：如果 ComfyUI 捕获到 CUDA OOM，Guardian 会全释放，ComfyUI 清理未使用的 CUDA cache，插件等待更高的 retry 目标，然后默认重试该节点一次。
+3. 进程重启：如果 ComfyUI 进程本身崩溃，插件无法从任意 custom node 的中途恢复。外部 supervisor 可以重启 ComfyUI 并重新排队 prompt，但真正的断点续跑需要工作流主动写入可持久化中间文件，例如 latent、图片或视频分段。
 
 ## 项目结构
 
@@ -250,6 +258,8 @@ ComfyUI 插件：
 - `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON 路径，默认 `vram_guardian_profile.json`。
 - `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: profile 学习结果额外安全边距。
 - `VRAM_GUARDIAN_OOM_BUMP_MB`: OOM 后下次目标提高量。
+- `VRAM_GUARDIAN_OOM_RETRY_FREE_MB`: OOM retry 前显式等待的空闲显存目标。默认 `0` 表示由插件根据原目标、heavy 目标和 OOM bump 自动计算。
+- `VRAM_GUARDIAN_OOM_RETRY_RESERVE_MB`: 自动计算 OOM retry 目标时预留的安全边距，默认等于 `VRAM_GUARDIAN_AUTO_FREE_RESERVE_MB`。
 - `VRAM_GUARDIAN_MAX_RETRY`: OOM 后重试次数，默认 `1`。
 
 ## 日志验证

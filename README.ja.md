@@ -23,13 +23,21 @@ Guardian プロセスが CUDA tensor で VRAM を保持し、ComfyUI プラグ�
 - node 開始前に release と wait を行う。
 - node 実行中に target free VRAM watermark を維持する。
 - node 終了後に base watermark に戻す。
-- OOM 後に release、CUDA cache cleanup、retry を行う。
+- OOM 後に release、CUDA cache cleanup、高めの retry free target への wait、retry を行う。
 
 できないこと:
 
 - 任意の低レベル `cudaMalloc` を瞬間的に完全制御する。
 - すでに他プロセスが占有している VRAM を強制的に取り戻す。
 - GPU 容量を超える workflow を成功させる。
+
+## Failure Recovery Model
+
+VRAM Guardian は recovery を 3 層で扱います:
+
+1. Prevention: node の burst target を推定し、node 開始前に release し、重い node の実行中は no-refill lease を維持します。
+2. Same-process OOM retry: ComfyUI が CUDA OOM を捕捉できた場合、Guardian は全 release し、ComfyUI は unused CUDA cache を cleanup し、plugin は高めの retry target まで wait してから node をデフォルト 1 回 retry します。
+3. Process restart: ComfyUI process 自体が crash した場合、plugin は任意の custom node の途中から resume できません。supervisor で ComfyUI を再起動して prompt を requeue することはできますが、本当の checkpoint resume には latent、image、video chunk などの durable intermediate file を workflow 側で保存する必要があります。
 
 ## Guardian の起動
 
@@ -201,6 +209,8 @@ ComfyUI plugin:
 - `VRAM_GUARDIAN_PROFILE_ENABLE`: local profile JSON を書き込む。`heavy-video` ではデフォルト有効。
 - `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: learned target の margin。
 - `VRAM_GUARDIAN_OOM_BUMP_MB`: OOM 後に target を増やす量。
+- `VRAM_GUARDIAN_OOM_RETRY_FREE_MB`: OOM retry 前に待つ明示的な free VRAM target。デフォルト `0` では前回 target、heavy target、OOM bump から自動計算します。
+- `VRAM_GUARDIAN_OOM_RETRY_RESERVE_MB`: automatic OOM retry target の safety reserve。デフォルトは `VRAM_GUARDIAN_AUTO_FREE_RESERVE_MB`。
 
 ## ログ例
 

@@ -33,7 +33,7 @@ Scheduler mode:
 4. The plugin waits until the target free VRAM is reached, or until a configurable timeout.
 5. During the node, Guardian keeps the higher target and only refills surplus above `target + hysteresis`.
 6. After the node, the high target is removed and Guardian returns to the base target.
-7. If a node OOMs, Guardian fully releases, ComfyUI clears CUDA cache, the node retries once, and the profile can bump the next target.
+7. If a node OOMs, Guardian fully releases, ComfyUI clears CUDA cache, waits for a higher retry free-VRAM target, retries once, and the profile can bump the next target.
 
 ## Important Limits
 
@@ -43,6 +43,14 @@ Scheduler mode:
 - Node retry after OOM may not be safe for every custom node if that node has external side effects.
 - If another process already owns the required VRAM, Guardian can wait and warn, but it cannot force that process to release memory.
 - This cannot make workflows fit on a GPU if the workflow genuinely needs more VRAM than the card has.
+
+## Failure Recovery Model
+
+VRAM Guardian handles recovery in three layers:
+
+1. Prevention: estimate the node's burst target, release before the node starts, and hold a no-refill lease while heavy nodes run.
+2. Same-process OOM retry: if ComfyUI catches a CUDA OOM, Guardian fully releases, ComfyUI clears unused CUDA cache, the plugin waits for a higher retry target, then retries the node once by default.
+3. Process restart: if ComfyUI itself crashes, the plugin cannot resume an arbitrary custom node from the middle. A supervisor can restart ComfyUI and requeue a prompt, but true checkpoint resume requires the workflow to write durable intermediate files, such as saved latents, images, or video chunks.
 
 ## Repository Layout
 
@@ -245,6 +253,8 @@ ComfyUI plugin:
 - `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON path. Default: `vram_guardian_profile.json`.
 - `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: extra margin added to learned targets.
 - `VRAM_GUARDIAN_OOM_BUMP_MB`: target increase after OOM.
+- `VRAM_GUARDIAN_OOM_RETRY_FREE_MB`: optional explicit free-VRAM target before an OOM retry. Default `0` lets the plugin choose automatically from the previous target, heavy target, and OOM bump.
+- `VRAM_GUARDIAN_OOM_RETRY_RESERVE_MB`: safety reserve kept out of the automatic OOM retry target. Default: `VRAM_GUARDIAN_AUTO_FREE_RESERVE_MB`.
 - `VRAM_GUARDIAN_MAX_RETRY`: node retry count after OOM. Default: `1`.
 
 Legacy plugin controls remain available:
