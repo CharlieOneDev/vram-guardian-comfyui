@@ -9,7 +9,13 @@ services:
     image: vram-guardian-comfyui:local
     container_name: vram-guardian
     restart: unless-stopped
-    gpus: all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
       - "127.0.0.1:${VRAM_GUARDIAN_PORT:-8765}:8765"
     environment:

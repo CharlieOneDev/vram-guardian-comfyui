@@ -67,6 +67,26 @@ Then start Guardian:
 docker compose up -d --build
 ```
 
+If your Compose implementation rejects GPU syntax with an error like `Additional property gpus is not allowed`, use the direct Docker fallback instead:
+
+```bash
+docker build -t vram-guardian-comfyui:local .
+docker rm -f vram-guardian 2>/dev/null || true
+docker run -d \
+  --name vram-guardian \
+  --restart unless-stopped \
+  --gpus all \
+  -p 127.0.0.1:8765:8765 \
+  -e VRAM_GUARDIAN_HOST=0.0.0.0 \
+  -e VRAM_GUARDIAN_PORT=8765 \
+  -e VRAM_GUARDIAN_DEVICE=cuda:0 \
+  -e VRAM_GUARDIAN_FRACTION=0.82 \
+  -e VRAM_GUARDIAN_MIN_FREE_MB=1536 \
+  -e VRAM_GUARDIAN_CHUNK_MB=256 \
+  -e VRAM_GUARDIAN_MAX_HOLD_MB=0 \
+  vram-guardian-comfyui:local
+```
+
 Check status:
 
 ```bash

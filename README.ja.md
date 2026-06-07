@@ -71,6 +71,26 @@ cd /mnt/g/codex/vram-guardian-comfyui
 docker compose up -d --build
 ```
 
+Compose implementation が GPU syntax を認識せず、`Additional property gpus is not allowed` のようなエラーを出す場合があります。その場合、Docker 自体は GPU を使えていても、compose file の GPU syntax が新しすぎる可能性があります。次の直接 Docker 起動を使ってください。
+
+```bash
+docker build -t vram-guardian-comfyui:local .
+docker rm -f vram-guardian 2>/dev/null || true
+docker run -d \
+  --name vram-guardian \
+  --restart unless-stopped \
+  --gpus all \
+  -p 127.0.0.1:8765:8765 \
+  -e VRAM_GUARDIAN_HOST=0.0.0.0 \
+  -e VRAM_GUARDIAN_PORT=8765 \
+  -e VRAM_GUARDIAN_DEVICE=cuda:0 \
+  -e VRAM_GUARDIAN_FRACTION=0.82 \
+  -e VRAM_GUARDIAN_MIN_FREE_MB=1536 \
+  -e VRAM_GUARDIAN_CHUNK_MB=256 \
+  -e VRAM_GUARDIAN_MAX_HOLD_MB=0 \
+  vram-guardian-comfyui:local
+```
+
 状態確認:
 
 ```bash
