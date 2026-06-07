@@ -133,6 +133,12 @@ SCHEDULER_WAIT_TIMEOUT = _env_float("VRAM_GUARDIAN_WAIT_TIMEOUT_SEC", 120.0)
 SCHEDULER_WAIT_POLL = _env_float("VRAM_GUARDIAN_WAIT_POLL_SEC", 0.5)
 SCHEDULER_LOG_INTERVAL = _env_float("VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC", 5.0)
 SCHEDULER_MONITOR_INTERVAL = _env_float("VRAM_GUARDIAN_MONITOR_INTERVAL_SEC", 0.5)
+ESTIMATOR_ENABLE = _env_bool("VRAM_GUARDIAN_ESTIMATOR_ENABLE", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
+ESTIMATOR_MARGIN_MB = _env_int("VRAM_GUARDIAN_ESTIMATOR_MARGIN_MB", 2048)
+ESTIMATOR_MIN_TARGET_MB = _env_int("VRAM_GUARDIAN_ESTIMATOR_MIN_TARGET_MB", 0)
+ESTIMATOR_MAX_FREE_MB = _env_int("VRAM_GUARDIAN_ESTIMATOR_MAX_FREE_MB", 0)
+HEAVY_REFILL_MODE = os.getenv("VRAM_GUARDIAN_HEAVY_REFILL_MODE", "no-refill").strip().lower()
+HEAVY_ALLOW_REFILL = HEAVY_REFILL_MODE in {"1", "true", "yes", "on", "refill", "fill"}
 OOM_BUMP_MB = _env_int("VRAM_GUARDIAN_OOM_BUMP_MB", 4096)
 PROFILE_ENABLE = _env_bool("VRAM_GUARDIAN_PROFILE_ENABLE", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
 PROFILE_PATH = Path(os.getenv("VRAM_GUARDIAN_PROFILE_PATH", "vram_guardian_profile.json"))
@@ -252,6 +258,7 @@ def _set_watermark(
     mode: bool,
     free_mb: int | None = None,
     hysteresis_mb: int | None = None,
+    allow_refill: bool | None = None,
     token: str | None = None,
 ) -> dict[str, Any] | None:
     fields: dict[str, Any] = {"mode": mode}
@@ -259,6 +266,8 @@ def _set_watermark(
         fields["free_mb"] = free_mb
     if hysteresis_mb is not None:
         fields["hysteresis_mb"] = hysteresis_mb
+    if allow_refill is not None:
+        fields["allow_refill"] = allow_refill
     if token is not None:
         fields["token"] = token
     response = _guardian_request("set_watermark", **fields)
@@ -456,6 +465,244 @@ def _input_signature(input_data_all: Any) -> dict[str, Any]:
     return signature
 
 
+def _iter_input_values(input_data_all: Any) -> list[tuple[str, Any]]:
+    if not isinstance(input_data_all, dict):
+        return []
+
+    items: list[tuple[str, Any]] = []
+    for key, values in input_data_all.items():
+        if isinstance(values, (list, tuple)):
+            for value in values:
+                items.append((str(key), value))
+        else:
+            items.append((str(key), values))
+    return items
+
+
+def _numeric_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def _shape_parts(value: Any) -> list[int]:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return []
+    try:
+        return [int(part) for part in shape]
+    except Exception:
+        return []
+
+
+def _collect_estimator_features(input_data_all: Any) -> dict[str, Any]:
+    width = 0
+    height = 0
+    frames = 1
+    context_frames = 0
+    scale = 1.0
+    tile_area = 0
+    reference_images = 0
+    has_large_tensor = False
+    tiled = False
+    force_offload = False
+    text_parts: list[str] = []
+
+    for key, value in _iter_input_values(input_data_all):
+        lowered_key = key.lower()
+        numeric = _numeric_value(value)
+        if numeric is not None:
+            if "width" in lowered_key:
+                width = max(width, int(numeric))
+            elif "height" in lowered_key:
+                height = max(height, int(numeric))
+            elif any(name in lowered_key for name in ("num_frames", "frame_count", "frames")):
+                frames = max(frames, int(numeric))
+            elif "context" in lowered_key:
+                context_frames = max(context_frames, int(numeric))
+            elif any(name in lowered_key for name in ("scale", "upscale", "factor")):
+                scale = max(scale, float(numeric))
+            elif "tile" in lowered_key:
+                tile_area = max(tile_area, int(numeric))
+
+        if isinstance(value, bool):
+            if "tile" in lowered_key:
+                tiled = tiled or value
+            if "offload" in lowered_key:
+                force_offload = force_offload or value
+        elif isinstance(value, str):
+            text_parts.append(value.lower())
+
+        if "reference_image" in lowered_key and value is not None:
+            reference_images += 1
+
+        shape = _shape_parts(value)
+        if len(shape) >= 4:
+            batch = max(1, shape[0])
+            if shape[-1] in {1, 3, 4}:
+                # IMAGE is usually [N, H, W, C].
+                frames = max(frames, batch)
+                height = max(height, shape[-3])
+                width = max(width, shape[-2])
+            else:
+                # LATENT is usually [N, C, H, W].
+                frames = max(frames, batch)
+                height = max(height, shape[-2] * 8)
+                width = max(width, shape[-1] * 8)
+            has_large_tensor = True
+        elif len(shape) == 3:
+            if shape[-1] in {1, 3, 4}:
+                height = max(height, shape[-3])
+                width = max(width, shape[-2])
+            else:
+                height = max(height, shape[-2])
+                width = max(width, shape[-1])
+            has_large_tensor = True
+
+    if tile_area > 0:
+        tiled = True
+
+    return {
+        "width": width,
+        "height": height,
+        "frames": frames,
+        "context_frames": context_frames,
+        "scale": scale,
+        "reference_images": reference_images,
+        "has_large_tensor": has_large_tensor,
+        "tiled": tiled,
+        "force_offload": force_offload,
+        "text": " ".join(text_parts),
+    }
+
+
+def _ceil_target_mb(value: float) -> int:
+    if value <= 0:
+        return 0
+    return max(512, ((int(value) + 511) // 512) * 512)
+
+
+def _estimate_node_peak_total_mb(class_name: str, input_data_all: Any) -> tuple[int, str, dict[str, Any]]:
+    if not ESTIMATOR_ENABLE:
+        return 0, "estimator-disabled", {}
+
+    features = _collect_estimator_features(input_data_all)
+    lowered = f"{class_name} {features.get('text', '')}".lower()
+    width = int(features.get("width", 0) or 0)
+    height = int(features.get("height", 0) or 0)
+    frames = max(1, int(features.get("frames", 1) or 1))
+    context_frames = int(features.get("context_frames", 0) or 0)
+    scale = max(1.0, float(features.get("scale", 1.0) or 1.0))
+    tiled = bool(features.get("tiled"))
+    force_offload = bool(features.get("force_offload"))
+    active_frames = frames
+    if context_frames > 0 and any(name in lowered for name in ("sampler", "wan", "ltx")):
+        active_frames = min(frames, max(1, context_frames))
+    elif any(name in lowered for name in ("sampler", "wan", "ltx")):
+        active_frames = min(frames, 96)
+
+    mp_frames = (max(width, 1) * max(height, 1) * max(active_frames, 1)) / 1_000_000
+    all_mp_frames = (max(width, 1) * max(height, 1) * max(frames, 1)) / 1_000_000
+    has_size = width > 0 and height > 0
+    peak = 0.0
+    source = ""
+
+    if any(name in lowered for name in ("wan", "ltx", "sampler")):
+        if has_size or features.get("has_large_tensor"):
+            peak = 22000 + mp_frames * 430
+            source = "estimate-video-sampler"
+        else:
+            return 0, "estimate-insufficient-inputs", {}
+    elif any(name in lowered for name in ("bernini", "image_embed", "imageembeds")):
+        if has_size or features.get("has_large_tensor"):
+            peak = 14000 + all_mp_frames * 150 + int(features.get("reference_images", 0) or 0) * 512
+            source = "estimate-embeds"
+        else:
+            return 0, "estimate-insufficient-inputs", {}
+    elif any(name in lowered for name in ("decode", "vae")):
+        if has_size or features.get("has_large_tensor"):
+            coeff = 45 if tiled else 160
+            peak = 9000 + all_mp_frames * coeff
+            source = "estimate-vae"
+        else:
+            return 0, "estimate-insufficient-inputs", {}
+    elif any(name in lowered for name in ("vsr", "upscale", "interpol", "rife", "segment")):
+        if has_size or features.get("has_large_tensor"):
+            peak = 12000 + all_mp_frames * (scale * scale) * 150
+            source = "estimate-video-post"
+        else:
+            return 0, "estimate-insufficient-inputs", {}
+    elif any(name in lowered for name in ("pose", "controlnet", "preprocessor", "dwpose")):
+        if has_size or features.get("has_large_tensor"):
+            peak = 6000 + all_mp_frames * 75
+            source = "estimate-preprocess"
+        else:
+            return 0, "estimate-insufficient-inputs", {}
+    elif any(name in lowered for name in ("loader", "model")):
+        peak = 14000
+        if any(name in lowered for name in ("bf16", "fp16", "float16")):
+            peak += 6000
+        if any(name in lowered for name in ("fp8", "int8", "gguf")):
+            peak -= 2500
+        source = "estimate-model"
+    elif features.get("has_large_tensor"):
+        peak = 5000 + all_mp_frames * 100
+        source = "estimate-shape"
+
+    if force_offload and peak > 0:
+        peak *= 0.85
+
+    total_mb = _guardian_total_mb()
+    if total_mb > 0 and peak > 0:
+        peak = min(peak, max(0.0, total_mb - AUTO_FREE_RESERVE_MB))
+
+    details = {
+        "width": width,
+        "height": height,
+        "frames": frames,
+        "active_frames": active_frames,
+        "mp_frames": round(mp_frames, 2),
+        "all_mp_frames": round(all_mp_frames, 2),
+        "tiled": tiled,
+        "force_offload": force_offload,
+    }
+    return _ceil_target_mb(peak), source, details
+
+
+def _estimated_target_free_mb(class_name: str, input_data_all: Any, status: dict[str, Any] | None) -> tuple[int, str]:
+    peak_total_mb, source, details = _estimate_node_peak_total_mb(class_name, input_data_all)
+    if peak_total_mb <= 0:
+        return 0, source
+
+    current_comfyui_mb = _status_comfyui_used_mb(status)
+    raw_target = max(0.0, peak_total_mb - current_comfyui_mb + ESTIMATOR_MARGIN_MB)
+    target = max(raw_target, float(ESTIMATOR_MIN_TARGET_MB), float(_base_free_target_mb(status)))
+    total_mb = _guardian_total_mb(status)
+    if ESTIMATOR_MAX_FREE_MB > 0:
+        target = min(target, float(ESTIMATOR_MAX_FREE_MB))
+    elif total_mb > 0:
+        target = min(target, max(0.0, total_mb - AUTO_FREE_RESERVE_MB))
+
+    target_mb = _ceil_target_mb(target)
+    LOG.info(
+        "[VRAM Estimator] class=%s peak_total=%sMiB current_comfyui=%.0fMiB target_free=%sMiB source=%s details=%s",
+        class_name,
+        peak_total_mb,
+        current_comfyui_mb,
+        target_mb,
+        source,
+        details,
+    )
+    return target_mb, source
+
+
 def _record_profile(run: "SchedulerRun", *, oom: bool = False, success: bool = False, bump: bool = False) -> None:
     if not PROFILE_ENABLE:
         return
@@ -520,7 +767,7 @@ def _matches_heavy_pattern(class_name: str) -> bool:
     return any(pattern and pattern in normalized for pattern in HEAVY_PATTERNS)
 
 
-def _scheduler_node_target_mb(class_name: str) -> tuple[int, str]:
+def _scheduler_node_target_mb(class_name: str, input_data_all: Any | None = None) -> tuple[int, str]:
     if not SCHEDULER_ENABLE:
         if ACTIVE_FREE_MB > 0 and ACTIVE_SCOPE in NODE_SCOPES:
             return ACTIVE_FREE_MB, "legacy-active"
@@ -531,15 +778,21 @@ def _scheduler_node_target_mb(class_name: str) -> tuple[int, str]:
     if class_name in NODE_FREE_MAP:
         target = NODE_FREE_MAP[class_name]
         source = "node-map"
-    elif class_name in HEAVY_NODES:
-        target = _heavy_free_target_mb()
-        source = "heavy"
-    elif _matches_heavy_pattern(class_name):
-        target = _heavy_free_target_mb()
-        source = "heavy-pattern"
-    elif _PROMPT_WATERMARK_TOKEN is None and _base_free_target_mb() > 0:
-        target = _base_free_target_mb()
-        source = "base"
+    else:
+        status = _guardian_status() if ESTIMATOR_ENABLE else None
+        estimated_target, estimated_source = _estimated_target_free_mb(class_name, input_data_all or {}, status)
+        if estimated_target > 0:
+            target = estimated_target
+            source = estimated_source
+        elif class_name in HEAVY_NODES:
+            target = _heavy_free_target_mb(status)
+            source = "heavy"
+        elif _matches_heavy_pattern(class_name):
+            target = _heavy_free_target_mb(status)
+            source = "heavy-pattern"
+        elif _PROMPT_WATERMARK_TOKEN is None and _base_free_target_mb(status) > 0:
+            target = _base_free_target_mb(status)
+            source = "base"
 
     profile_target = _profile_target_mb(class_name)
     if profile_target > target:
@@ -547,6 +800,15 @@ def _scheduler_node_target_mb(class_name: str) -> tuple[int, str]:
         source = "profile"
 
     return max(0, target), source
+
+
+def _node_watermark_allow_refill(target_free_mb: int, target_source: str) -> bool:
+    base_target = _base_free_target_mb()
+    if target_source in {"base", "legacy-active", "disabled", "none"}:
+        return True
+    if target_free_mb <= base_target + max(512, ACTIVE_HYSTERESIS_MB):
+        return True
+    return HEAVY_ALLOW_REFILL
 
 
 def _status_free_mb(status: dict[str, Any] | None) -> float:
@@ -565,6 +827,24 @@ def _status_held_mb(status: dict[str, Any] | None) -> float:
         return float(status.get("held_mb", 0) or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _status_comfyui_used_mb(status: dict[str, Any] | None) -> float:
+    values: list[float] = []
+    if status:
+        try:
+            value = float(status.get("comfyui_used_mb", 0) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            values.append(value)
+    try:
+        if torch.cuda.is_available():
+            values.append(float(torch.cuda.memory_reserved()) / (1024 * 1024))
+            values.append(float(torch.cuda.memory_allocated()) / (1024 * 1024))
+    except Exception:
+        LOG.debug("failed to read local torch CUDA memory", exc_info=True)
+    return max(values) if values else 0.0
 
 
 def _wait_for_free_mb(label: str, target_free_mb: int) -> dict[str, Any] | None:
@@ -655,16 +935,17 @@ def _watermark_token(label: str) -> str:
     return f"{os.getpid()}:{label}:{time.monotonic_ns()}"
 
 
-def _begin_watermark(label: str, free_mb: int, hysteresis_mb: int = ACTIVE_HYSTERESIS_MB) -> str:
+def _begin_watermark(label: str, free_mb: int, hysteresis_mb: int = ACTIVE_HYSTERESIS_MB, allow_refill: bool = True) -> str:
     token = _watermark_token(label)
     LOG.info(
-        "enabling Guardian active watermark for %s: free=%sMB hysteresis=%sMB token=%s",
+        "enabling Guardian active watermark for %s: free=%sMB hysteresis=%sMB allow_refill=%s token=%s",
         label,
         free_mb,
         hysteresis_mb,
+        allow_refill,
         token,
     )
-    _set_watermark(True, free_mb, hysteresis_mb, token=token)
+    _set_watermark(True, free_mb, hysteresis_mb, allow_refill=allow_refill, token=token)
     _local_cuda_cleanup()
     return token
 
@@ -828,16 +1109,19 @@ def _install_get_output_data_patch() -> None:
             class_name = _node_class_name(obj)
             node_id = _node_unique_id(args, kwargs, obj)
             label = _node_label(args, kwargs)
-            input_signature = _input_signature(_node_input_data(args, kwargs))
-            target_free_mb, target_source = _scheduler_node_target_mb(class_name)
+            input_data = _node_input_data(args, kwargs)
+            input_signature = _input_signature(input_data)
+            target_free_mb, target_source = _scheduler_node_target_mb(class_name, input_data)
             active_scheduler = target_free_mb > 0
+            allow_refill = _node_watermark_allow_refill(target_free_mb, target_source)
             if active_scheduler or ACTIVE_SCOPE in NODE_SCOPES:
                 LOG.info(
-                    "[VRAM Scheduler] node=%s class=%s target_free=%sMiB source=%s",
+                    "[VRAM Scheduler] node=%s class=%s target_free=%sMiB source=%s allow_refill=%s",
                     label,
                     class_name,
                     target_free_mb,
                     target_source,
+                    allow_refill,
                 )
             else:
                 LOG.debug("[VRAM Scheduler] node=%s class=%s target_free=0 source=%s", label, class_name, target_source)
@@ -849,7 +1133,7 @@ def _install_get_output_data_patch() -> None:
                 profile_recorded = False
                 try:
                     if active_scheduler and not full_release_retry:
-                        token = _begin_watermark(label, target_free_mb)
+                        token = _begin_watermark(label, target_free_mb, allow_refill=allow_refill)
                         status = _wait_for_free_mb(label, target_free_mb)
                         run = SchedulerRun(label, class_name, node_id, target_free_mb, input_signature)
                         run.start(status)
@@ -930,16 +1214,19 @@ def _install_get_output_data_patch() -> None:
         class_name = _node_class_name(obj)
         node_id = _node_unique_id(args, kwargs, obj)
         label = _node_label(args, kwargs)
-        input_signature = _input_signature(_node_input_data(args, kwargs))
-        target_free_mb, target_source = _scheduler_node_target_mb(class_name)
+        input_data = _node_input_data(args, kwargs)
+        input_signature = _input_signature(input_data)
+        target_free_mb, target_source = _scheduler_node_target_mb(class_name, input_data)
         active_scheduler = target_free_mb > 0
+        allow_refill = _node_watermark_allow_refill(target_free_mb, target_source)
         if active_scheduler or ACTIVE_SCOPE in NODE_SCOPES:
             LOG.info(
-                "[VRAM Scheduler] node=%s class=%s target_free=%sMiB source=%s",
+                "[VRAM Scheduler] node=%s class=%s target_free=%sMiB source=%s allow_refill=%s",
                 label,
                 class_name,
                 target_free_mb,
                 target_source,
+                allow_refill,
             )
         else:
             LOG.debug("[VRAM Scheduler] node=%s class=%s target_free=0 source=%s", label, class_name, target_source)
@@ -951,7 +1238,7 @@ def _install_get_output_data_patch() -> None:
             profile_recorded = False
             try:
                 if active_scheduler and not full_release_retry:
-                    token = _begin_watermark(label, target_free_mb)
+                    token = _begin_watermark(label, target_free_mb, allow_refill=allow_refill)
                     status = _wait_for_free_mb(label, target_free_mb)
                     run = SchedulerRun(label, class_name, node_id, target_free_mb, input_signature)
                     run.start(status)
@@ -1056,11 +1343,14 @@ def _install() -> None:
         status = _guardian_request("status")
         LOG.info(
             "VRAM Guardian scheduler config: enabled=%s preset=%s base_free=%sMiB heavy_free=%sMiB "
-            "profile=%s heavy_patterns=%s node_map=%s",
+            "estimator=%s estimator_margin=%sMiB heavy_refill_mode=%s profile=%s heavy_patterns=%s node_map=%s",
             SCHEDULER_ENABLE,
             SCHEDULER_PRESET,
             _base_free_target_mb(status),
             _heavy_free_target_mb(status),
+            ESTIMATOR_ENABLE,
+            ESTIMATOR_MARGIN_MB,
+            HEAVY_REFILL_MODE,
             PROFILE_ENABLE,
             ",".join(sorted(HEAVY_PATTERNS)) or "-",
             ",".join(sorted(NODE_FREE_MAP)) or "-",

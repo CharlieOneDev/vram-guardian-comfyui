@@ -160,7 +160,9 @@ python main.py
 
 - Scheduler 默认启用。
 - 基础 workflow 空闲显存目标会自动计算，并刻意保持低暴露：`min(total_vram * 0.14, 6144 MiB)`。
-- 重节点空闲显存目标自动计算：`min(total_vram * 0.72, 32768 MiB)`。
+- 重节点 fallback 空闲显存目标自动计算：`min(total_vram * 0.72, 32768 MiB)`。
+- Estimator 默认启用。它会读取节点已解析输入，例如宽、高、帧数、tensor shape、tiling、scale、模型名、精度和 offload 标记，然后计算 `target_free = estimated_peak_total - current_comfyui_used + margin`。
+- 重节点 lease 默认是 `no-refill`：节点运行期间 Guardian 可以继续释放显存，但不会主动把多余 free 显存占回去，直到该节点结束。
 - 本地 profiling 默认启用，写入 `vram_guardian_profile.json`。
 - 重节点通过宽泛 class-name 模糊匹配识别，例如 `sampler`、`wan`、`ltx`、`bernini`、`vsr`、`upscale`、`interpol`、`decode`、`vae`、`pose`、`model`。
 
@@ -168,10 +170,10 @@ python main.py
 
 ```text
 base free target:  约 6 GiB
-heavy free target: 约 32 GiB
+heavy fallback target: 约 32 GiB
 ```
 
-这样在 workflow 空转、等待或执行轻节点时，暴露在 free 状态的显存会尽量少。只有重节点即将开始时，Guardian 才会快速释放出大块 burst window。
+这样在 workflow 空转、等待或执行轻节点时，暴露在 free 状态的显存会尽量少。重节点即将开始时，如果 estimator 能拿到足够参数，Guardian 只释放估算出的 burst window；如果参数不足，再退回 heavy target。
 
 仍然可以手动覆盖：
 
@@ -201,12 +203,13 @@ python main.py
 1. ComfyUI 开始执行 prompt 时，插件开启 base watermark。
 2. 普通节点使用 `BASE_FREE_MB` 作为基础空闲显存目标。
 3. 如果节点 class 命中 `NODE_FREE_MAP`，插件会把目标 free 提高到对应值。
-4. 如果节点 class 在 `HEAVY_NODES` 中，或命中 `HEAVY_PATTERNS`，则使用 `HEAVY_FREE_MB`。
-5. 节点执行前，插件调用 Guardian 的 `ensure_free`，让 Guardian 释放到目标 free。
-6. 如果 free 不够，插件会等待，并周期性打印日志。
-7. 节点运行中，Guardian 保持该节点目标水位。
-8. 节点完成后，高水位 token 关闭，Guardian 回到 base 水位。
-9. prompt 结束后，Guardian 回到正常防抢占状态。
+4. 如果 estimator 可以根据节点输入估算峰值，则优先使用估算出的 target free。
+5. 如果节点 class 在 `HEAVY_NODES` 中，或命中 `HEAVY_PATTERNS`，但参数不足以估算，则使用 `HEAVY_FREE_MB`。
+6. 节点执行前，插件调用 Guardian 的 `ensure_free`，让 Guardian 释放到目标 free。
+7. 如果 free 不够，插件会等待，并周期性打印日志。
+8. 重节点运行中默认 no-refill，Guardian 只释放不回填。
+9. 节点完成后，高水位 token 关闭，Guardian 回到 base 水位。
+10. prompt 结束后，Guardian 回到正常防抢占状态。
 
 ## 环境变量
 
@@ -231,6 +234,10 @@ ComfyUI 插件：
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: 自动重节点目标比例，默认 `0.72`。
 - `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: 自动基础目标上限，默认 `6144`。
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: 自动重节点目标上限，默认 `32768`。
+- `VRAM_GUARDIAN_ESTIMATOR_ENABLE`: 根据节点已解析输入估算 target free，`heavy-video` 下默认启用。
+- `VRAM_GUARDIAN_ESTIMATOR_MARGIN_MB`: estimator 额外安全边距，默认 `2048`。
+- `VRAM_GUARDIAN_ESTIMATOR_MAX_FREE_MB`: estimator target free 上限，`0` 表示使用 GPU 总显存减保留值。
+- `VRAM_GUARDIAN_HEAVY_REFILL_MODE`: 重节点 lease 回填策略，默认 `no-refill`。设置为 `refill` 可允许重节点期间回填。
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: 节点 class 到目标 free 的 JSON 映射。
 - `VRAM_GUARDIAN_HEAVY_NODES`: 逗号分隔的重节点 class。
 - `VRAM_GUARDIAN_HEAVY_PATTERNS`: 逗号分隔的小写 class-name 片段，匹配到就按重节点处理。`heavy-video` 下默认是视频工作流常见关键词。
@@ -256,7 +263,8 @@ total=45458MiB free=6144MiB guardian_held=33200MiB target=37275MiB external_calc
 Scheduler 日志示例：
 
 ```text
-[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
+[VRAM Estimator] class=WanVideoSampler peak_total=43008MiB current_comfyui=12288MiB target_free=32768MiB source=estimate-video-sampler details={'width': 576, 'height': 1024, 'frames': 161, 'active_frames': 81}
+[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=estimate-video-sampler allow_refill=False
 [VRAM Scheduler] WanVideoSampler#12 waiting: free=6144MiB target=32768MiB guardian_held=26624MiB
 [VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
@@ -269,7 +277,7 @@ Scheduler 日志示例：
 
 ## 调参建议
 
-- 重视频工作流 OOM：提高 `BASE_FREE_MB` 或 `HEAVY_FREE_MB`。
+- 重视频工作流 OOM：提高 `ESTIMATOR_MARGIN_MB`、`HEAVY_FREE_MB` 或 `ESTIMATOR_MAX_FREE_MB`。
 - 日志显示某个特定 class 反复 OOM：再给 `NODE_FREE_MAP` 加单独目标。
 - 防抢占不够强：降低 `BASE_FREE_MB`、`HEAVY_FREE_MB` 或自动上限，或者提高 `VRAM_GUARDIAN_FRACTION`。
 - 不想长时间等待：降低 `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`。

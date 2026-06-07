@@ -170,7 +170,9 @@ Default `heavy-video` behavior:
 
 - Scheduler mode is enabled by default.
 - Base workflow free target is automatic and intentionally low: `min(total_vram * 0.14, 6144 MiB)`.
-- Heavy node free target is automatic: `min(total_vram * 0.72, 32768 MiB)`.
+- Heavy node fallback target is automatic: `min(total_vram * 0.72, 32768 MiB)`.
+- The estimator is enabled by default. It inspects resolved node inputs such as width, height, frames, tensor shapes, tiling, scale, model names, precision, and offload flags, then computes `target_free = estimated_peak_total - current_comfyui_used + margin`.
+- Heavy node leases default to `no-refill`: Guardian may release more memory while the node runs, but it will not reclaim surplus free VRAM until the node exits.
 - Local profiling is enabled by default and writes `vram_guardian_profile.json`.
 - Heavy nodes are detected by broad class-name patterns such as `sampler`, `wan`, `ltx`, `bernini`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, and `model`.
 
@@ -178,10 +180,10 @@ For a 48 GiB/L40-class GPU this means roughly:
 
 ```text
 base free target:  about 6 GiB
-heavy free target: about 32 GiB
+heavy fallback target: about 32 GiB
 ```
 
-This keeps free VRAM exposure low while the workflow is idle or running light nodes. Guardian releases a large burst window only immediately before a heavy node starts.
+This keeps free VRAM exposure low while the workflow is idle or running light nodes. Before a heavy node starts, Guardian releases only the estimated burst window when enough information is available; otherwise it falls back to the heavy target.
 
 Manual overrides are still available:
 
@@ -227,6 +229,10 @@ ComfyUI plugin:
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: automatic heavy target fraction. Default: `0.72`.
 - `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base target cap. Default: `6144`.
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: automatic heavy target cap. Default: `32768`.
+- `VRAM_GUARDIAN_ESTIMATOR_ENABLE`: estimate node targets from resolved inputs. Default: `true` under `heavy-video`.
+- `VRAM_GUARDIAN_ESTIMATOR_MARGIN_MB`: extra free VRAM added to estimator output. Default: `2048`.
+- `VRAM_GUARDIAN_ESTIMATOR_MAX_FREE_MB`: optional cap for estimator target free MiB. `0` means use GPU total minus reserve.
+- `VRAM_GUARDIAN_HEAVY_REFILL_MODE`: heavy lease refill policy. Default: `no-refill`. Set to `refill` to allow Guardian to reclaim surplus free VRAM during heavy nodes.
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: JSON object mapping node class names to target free MiB.
 - `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated heavy node class names using `HEAVY_FREE_MB`.
 - `VRAM_GUARDIAN_HEAVY_PATTERNS`: comma-separated lowercase class-name substrings treated as heavy nodes. Defaults to a video-oriented set under `heavy-video`.
@@ -261,6 +267,8 @@ Scheduler logs use the `[VRAM Scheduler]` prefix:
 
 ```text
 [VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
+[VRAM Estimator] class=WanVideoSampler peak_total=43008MiB current_comfyui=12288MiB target_free=32768MiB source=estimate-video-sampler details={'width': 576, 'height': 1024, 'frames': 161, 'active_frames': 81}
+[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=estimate-video-sampler allow_refill=False
 [VRAM Scheduler] WanVideoSampler#12 waiting: free=6144MiB target=32768MiB guardian_held=26624MiB
 [VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
@@ -273,7 +281,7 @@ If Guardian has released all held memory and the target is still not available:
 
 ## Tuning Notes
 
-- Increase `BASE_FREE_MB` or `HEAVY_FREE_MB` if heavy video workflows still OOM.
+- Increase `ESTIMATOR_MARGIN_MB`, `HEAVY_FREE_MB`, or `ESTIMATOR_MAX_FREE_MB` if heavy video workflows still OOM.
 - Add a node to `NODE_FREE_MAP` only when logs show a specific class needs a custom target.
 - Lower `BASE_FREE_MB`, `HEAVY_FREE_MB`, or the automatic caps if protection against other users is more important than latency.
 - Lower `WAIT_TIMEOUT_SEC` if workloads should fail fast when the GPU is already occupied.

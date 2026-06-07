@@ -18,6 +18,14 @@ MIB = 1024 * 1024
 LOG = logging.getLogger("vram_guardian")
 
 
+def parse_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
 def query_gpu_processes() -> list[dict[str, Any]]:
     try:
         output = subprocess.check_output(
@@ -112,6 +120,7 @@ class GuardianConfig:
     watermark_mode: bool = False
     watermark_free_mb: int = 0
     watermark_hysteresis_mb: int = 2048
+    watermark_allow_refill: bool = True
     watermark_interval_sec: float = 1.0
     watermark_release_cooldown_sec: float = 5.0
 
@@ -150,7 +159,8 @@ class VramGuardian:
         self.manual_watermark_mode = config.watermark_mode
         self.manual_watermark_free_mb = config.watermark_free_mb
         self.manual_watermark_hysteresis_mb = config.watermark_hysteresis_mb
-        self.watermark_sessions: dict[str, tuple[int, int]] = {}
+        self.manual_watermark_allow_refill = config.watermark_allow_refill
+        self.watermark_sessions: dict[str, tuple[int, int, bool]] = {}
         self.watermark_cooldown_until = 0.0
 
     def held_bytes_unlocked(self) -> int:
@@ -319,6 +329,7 @@ class VramGuardian:
         mode: bool,
         free_mb: int | None = None,
         hysteresis_mb: int | None = None,
+        allow_refill: bool | None = None,
         token: str | None = None,
     ) -> dict[str, Any]:
         with self.lock:
@@ -326,7 +337,8 @@ class VramGuardian:
                 if mode:
                     session_free_mb = max(0, free_mb if free_mb is not None else self.config.watermark_free_mb)
                     session_hysteresis_mb = max(16, hysteresis_mb if hysteresis_mb is not None else self.config.watermark_hysteresis_mb)
-                    self.watermark_sessions[token] = (session_free_mb, session_hysteresis_mb)
+                    session_allow_refill = self.config.watermark_allow_refill if allow_refill is None else bool(allow_refill)
+                    self.watermark_sessions[token] = (session_free_mb, session_hysteresis_mb, session_allow_refill)
                 else:
                     self.watermark_sessions.pop(token, None)
             else:
@@ -335,15 +347,18 @@ class VramGuardian:
                     self.manual_watermark_free_mb = max(0, free_mb)
                 if hysteresis_mb is not None:
                     self.manual_watermark_hysteresis_mb = max(16, hysteresis_mb)
+                if allow_refill is not None:
+                    self.manual_watermark_allow_refill = bool(allow_refill)
 
             self.refresh_watermark_config_unlocked()
             self.wake_event.set()
             status = self.apply_watermark_unlocked() if self.config.watermark_mode else self.status_unlocked()
             LOG.info(
-                "watermark mode=%s free_target=%sMiB hysteresis=%sMiB sessions=%s token=%s | %s",
+                "watermark mode=%s free_target=%sMiB hysteresis=%sMiB allow_refill=%s sessions=%s token=%s | %s",
                 self.config.watermark_mode,
                 self.config.watermark_free_mb,
                 self.config.watermark_hysteresis_mb,
+                self.config.watermark_allow_refill,
                 len(self.watermark_sessions),
                 token or "manual",
                 self.format_memory_summary(status),
@@ -353,13 +368,15 @@ class VramGuardian:
     def refresh_watermark_config_unlocked(self) -> None:
         if self.watermark_sessions:
             self.config.watermark_mode = True
-            self.config.watermark_free_mb = max(free_mb for free_mb, _ in self.watermark_sessions.values())
-            self.config.watermark_hysteresis_mb = max(hysteresis_mb for _, hysteresis_mb in self.watermark_sessions.values())
+            self.config.watermark_free_mb = max(free_mb for free_mb, _, _ in self.watermark_sessions.values())
+            self.config.watermark_hysteresis_mb = max(hysteresis_mb for _, hysteresis_mb, _ in self.watermark_sessions.values())
+            self.config.watermark_allow_refill = all(allow_refill for _, _, allow_refill in self.watermark_sessions.values())
             return
 
         self.config.watermark_mode = self.manual_watermark_mode
         self.config.watermark_free_mb = self.manual_watermark_free_mb
         self.config.watermark_hysteresis_mb = self.manual_watermark_hysteresis_mb
+        self.config.watermark_allow_refill = self.manual_watermark_allow_refill
 
     def apply_watermark_unlocked(self) -> dict[str, Any]:
         if not self.config.watermark_mode or self.config.watermark_free_mb <= 0:
@@ -388,6 +405,14 @@ class VramGuardian:
             return status
 
         if free_mb > target_mb + hysteresis_mb:
+            if not self.config.watermark_allow_refill:
+                return self.status_unlocked(
+                    extra={
+                        "allocated_bytes": 0,
+                        "released_bytes": 0,
+                        "watermark_action": "no_refill",
+                    }
+                )
             cooldown_remaining = self.watermark_cooldown_until - time.monotonic()
             if cooldown_remaining > 0:
                 return self.status_unlocked(
@@ -474,6 +499,7 @@ class VramGuardian:
             "watermark_mode": self.config.watermark_mode,
             "watermark_free_mb": self.config.watermark_free_mb,
             "watermark_hysteresis_mb": self.config.watermark_hysteresis_mb,
+            "watermark_allow_refill": self.config.watermark_allow_refill,
             "watermark_interval_sec": self.config.watermark_interval_sec,
             "watermark_release_cooldown_sec": self.config.watermark_release_cooldown_sec,
             "watermark_session_count": len(self.watermark_sessions),
@@ -594,17 +620,17 @@ class GuardianTCPServer(socketserver.ThreadingTCPServer):
             pause_refill_sec = float(request.get("pause_refill_sec", 0) or 0)
             return self.guardian.ensure_free(free_mb, pause_refill_sec=pause_refill_sec)
         if cmd == "set_watermark":
-            mode = request.get("mode", True)
-            if isinstance(mode, str):
-                mode = mode.strip().lower() not in {"0", "false", "no", "off"}
+            mode = parse_bool(request.get("mode"), True)
             free_mb = request.get("free_mb")
             hysteresis_mb = request.get("hysteresis_mb")
+            allow_refill = request.get("allow_refill")
             token = request.get("token")
             return self.guardian.set_watermark(
-                bool(mode),
-                None if free_mb is None else int(free_mb),
-                None if hysteresis_mb is None else int(hysteresis_mb),
-                None if token is None else str(token),
+                mode,
+                free_mb=None if free_mb is None else int(free_mb),
+                hysteresis_mb=None if hysteresis_mb is None else int(hysteresis_mb),
+                allow_refill=None if allow_refill is None else parse_bool(allow_refill),
+                token=None if token is None else str(token),
             )
         if cmd == "set_fraction":
             return self.guardian.set_fraction(float(request["fraction"]))

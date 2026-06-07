@@ -125,7 +125,9 @@ Default `heavy-video` behavior:
 
 - Scheduler mode はデフォルトで有効。
 - base workflow target は低い free exposure を保つため自動計算: `min(total_vram * 0.14, 6144 MiB)`。
-- heavy node target は自動計算: `min(total_vram * 0.72, 32768 MiB)`。
+- heavy node fallback target は自動計算: `min(total_vram * 0.72, 32768 MiB)`。
+- estimator はデフォルトで有効です。resolved node input から width、height、frames、tensor shape、tiling、scale、model name、precision、offload flag を読み、`target_free = estimated_peak_total - current_comfyui_used + margin` を計算します。
+- heavy node lease はデフォルトで `no-refill` です。node 実行中 Guardian は追加 release できますが、node 終了まで余った free VRAM を reclaim しません。
 - local profiling はデフォルトで有効で、`vram_guardian_profile.json` に書き込みます。
 - heavy node は `sampler`, `wan`, `ltx`, `bernini`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, `model` などの class-name pattern で検出されます。
 
@@ -133,10 +135,10 @@ Default `heavy-video` behavior:
 
 ```text
 base free target:  about 6 GiB
-heavy free target: about 32 GiB
+heavy fallback target: about 32 GiB
 ```
 
-これにより workflow が idle、waiting、light node 実行中の free VRAM exposure は低く保たれます。heavy node 開始直前だけ、Guardian が大きな burst window を release します。
+これにより workflow が idle、waiting、light node 実行中の free VRAM exposure は低く保たれます。heavy node 開始前、十分な入力情報があれば Guardian は estimator が計算した burst window だけ release し、情報不足なら heavy target に fallback します。
 
 Manual override:
 
@@ -158,11 +160,12 @@ export VRAM_GUARDIAN_SCHEDULER_PRESET=manual
 1. ComfyUI prompt 開始時、plugin が base watermark を開きます。
 2. 通常 node は `BASE_FREE_MB` を基準に実行されます。
 3. `NODE_FREE_MAP` に一致する node は、その target free VRAM まで Guardian を release します。
-4. `HEAVY_NODES` または `HEAVY_PATTERNS` に一致する node は `HEAVY_FREE_MB` を使用します。
-5. node 実行前、plugin は `ensure_free` を呼び、target に届くまで wait します。
-6. node 実行中、Guardian は高い watermark を維持します。
-7. node 終了後、高い watermark を閉じ、base watermark に戻します。
-8. prompt 終了後、Guardian は通常の予約状態に戻ります。
+4. estimator が node input から peak を推定できる場合、その target free を優先します。
+5. `HEAVY_NODES` または `HEAVY_PATTERNS` に一致し、推定に必要な情報が不足する node は `HEAVY_FREE_MB` を使用します。
+6. node 実行前、plugin は `ensure_free` を呼び、target に届くまで wait します。
+7. heavy node 実行中はデフォルト no-refill で、Guardian は release のみ行います。
+8. node 終了後、高い watermark を閉じ、base watermark に戻します。
+9. prompt 終了後、Guardian は通常の予約状態に戻ります。
 
 ## 主要な環境変数
 
@@ -185,6 +188,10 @@ ComfyUI plugin:
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_FRACTION`: automatic heavy fraction。デフォルト `0.72`。
 - `VRAM_GUARDIAN_AUTO_BASE_FREE_CAP_MB`: automatic base cap。デフォルト `6144`。
 - `VRAM_GUARDIAN_AUTO_HEAVY_FREE_CAP_MB`: automatic heavy cap。デフォルト `32768`。
+- `VRAM_GUARDIAN_ESTIMATOR_ENABLE`: resolved inputs から target free を推定。`heavy-video` ではデフォルト有効。
+- `VRAM_GUARDIAN_ESTIMATOR_MARGIN_MB`: estimator の safety margin。デフォルト `2048`。
+- `VRAM_GUARDIAN_ESTIMATOR_MAX_FREE_MB`: estimator target free の cap。`0` は GPU total から reserve を引いた値。
+- `VRAM_GUARDIAN_HEAVY_REFILL_MODE`: heavy lease refill policy。デフォルト `no-refill`。`refill` にすると heavy node 中の reclaim を許可します。
 - `VRAM_GUARDIAN_NODE_FREE_MAP`: node class と target free MiB の JSON map。
 - `VRAM_GUARDIAN_HEAVY_NODES`: comma-separated heavy node class names。
 - `VRAM_GUARDIAN_HEAVY_PATTERNS`: comma-separated lowercase class-name substrings。`heavy-video` では video workflow 用 pattern がデフォルト。
@@ -206,7 +213,8 @@ total=45458MiB free=6144MiB guardian_held=33200MiB target=37275MiB external_calc
 Scheduler:
 
 ```text
-[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=heavy-pattern
+[VRAM Estimator] class=WanVideoSampler peak_total=43008MiB current_comfyui=12288MiB target_free=32768MiB source=estimate-video-sampler details={'width': 576, 'height': 1024, 'frames': 161, 'active_frames': 81}
+[VRAM Scheduler] node=WanVideoSampler#12 class=WanVideoSampler target_free=32768MiB source=estimate-video-sampler allow_refill=False
 [VRAM Scheduler] WanVideoSampler#12 waiting: free=6144MiB target=32768MiB guardian_held=26624MiB
 [VRAM Scheduler] WanVideoSampler#12 free reached 32800MiB target=32768MiB; continuing
 ```
@@ -219,7 +227,7 @@ Guardian がすべて release しても target に届かない場合:
 
 ## Tuning
 
-- heavy video workflow が OOM する場合は `BASE_FREE_MB` または `HEAVY_FREE_MB` を上げます。
+- heavy video workflow が OOM する場合は `ESTIMATOR_MARGIN_MB`、`HEAVY_FREE_MB`、または `ESTIMATOR_MAX_FREE_MB` を上げます。
 - 特定 class が繰り返し OOM する場合のみ `NODE_FREE_MAP` に個別 target を追加します。
 - 他プロセスへの防御を強めたい場合は `BASE_FREE_MB`、`HEAVY_FREE_MB`、または automatic cap を下げます。
 - GPU が混雑しているときに早く失敗させたい場合は `WAIT_TIMEOUT_SEC` を下げます。
