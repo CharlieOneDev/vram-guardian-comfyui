@@ -83,11 +83,17 @@ class VramGuardian:
                 if size < 16 * MIB:
                     break
 
+                chunk = None
                 try:
-                    self.chunks.append(torch.empty(size, dtype=torch.uint8, device=self.device))
+                    chunk = torch.empty(size, dtype=torch.uint8, device=self.device)
+                    chunk.zero_()
+                    torch.cuda.synchronize(self.device)
+                    self.chunks.append(chunk)
                     allocated += size
                     attempts = 0
                 except torch.cuda.OutOfMemoryError:
+                    if chunk is not None:
+                        del chunk
                     attempts += 1
                     torch.cuda.empty_cache()
                     if attempts >= 3 or size <= 16 * MIB:
@@ -126,6 +132,7 @@ class VramGuardian:
     def status_unlocked(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         free, total = self.mem_info_unlocked()
         held = self.held_bytes_unlocked()
+        external_used = max(0, total - free - held)
         data: dict[str, Any] = {
             "ok": True,
             "device": str(self.device),
@@ -140,6 +147,8 @@ class VramGuardian:
             "free_mb": round(free / MIB, 2),
             "total_bytes": total,
             "total_mb": round(total / MIB, 2),
+            "external_used_bytes": external_used,
+            "external_used_mb": round(external_used / MIB, 2),
             "target_bytes": self.target_bytes_unlocked(),
         }
         if extra:
