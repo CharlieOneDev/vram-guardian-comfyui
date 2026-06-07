@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import socketserver
+import subprocess
 import sys
 import threading
 import time
@@ -15,6 +16,87 @@ import torch
 
 MIB = 1024 * 1024
 LOG = logging.getLogger("vram_guardian")
+
+
+def query_gpu_processes() -> list[dict[str, Any]]:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=pid,process_name,used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        )
+    except Exception:
+        return []
+
+    processes: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        parts = [part.strip() for part in line.split(",", 2)]
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            used_mb = float(parts[2].split()[0])
+        except ValueError:
+            continue
+
+        cmdline = read_process_cmdline(pid)
+        cwd = read_process_cwd(pid)
+        processes.append(
+            {
+                "pid": pid,
+                "process_name": parts[1],
+                "used_mb": round(used_mb, 2),
+                "role": classify_process(pid, parts[1], cmdline, cwd),
+                "cmdline": compact_command(cmdline or parts[1]),
+                "cwd": cwd,
+            }
+        )
+    return processes
+
+
+def read_process_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        return ""
+    return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
+def read_process_cwd(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def classify_process(pid: int, process_name: str, cmdline: str, cwd: str) -> str:
+    comfyui_pid = os.getenv("VRAM_GUARDIAN_COMFYUI_PID", "").strip()
+    if comfyui_pid and comfyui_pid == str(pid):
+        return "comfyui"
+    if pid == os.getpid() or "vram_guardian.server" in cmdline:
+        return "guardian"
+
+    text = f"{process_name} {cmdline} {cwd}"
+    if "/workspace/ComfyUI" in text or "ComfyUI/main.py" in text:
+        return "comfyui"
+    if cwd.endswith("/ComfyUI") and "python" in process_name.lower():
+        return "comfyui"
+    return "other"
+
+
+def compact_command(command: str, limit: int = 160) -> str:
+    command = " ".join(command.split())
+    if len(command) <= limit:
+        return command
+    return command[: limit - 3] + "..."
 
 
 @dataclass
@@ -161,7 +243,14 @@ class VramGuardian:
             except Exception:
                 LOG.debug("torch.cuda.ipc_collect failed", exc_info=True)
 
-            return self.status_unlocked(extra={"released_bytes": released})
+            status = self.status_unlocked(extra={"released_bytes": released})
+            LOG.info(
+                "release freed %.2f MiB pause_refill=%.1fs | %s",
+                released / MIB,
+                pause_refill_sec,
+                self.format_memory_summary(status),
+            )
+            return status
 
     def start_auto_refill(self) -> None:
         if not self.config.auto_refill or self.auto_refill_thread is not None:
@@ -185,7 +274,7 @@ class VramGuardian:
                 status = self.maybe_refill()
                 allocated = int(status.get("allocated_bytes", 0) or 0)
                 if allocated > 0:
-                    LOG.info("auto refill allocated %.2f MiB", allocated / MIB)
+                    LOG.info("auto refill allocated %.2f MiB | %s", allocated / MIB, self.format_memory_summary(status))
             except Exception:
                 LOG.exception("auto refill failed")
 
@@ -199,6 +288,7 @@ class VramGuardian:
         held = self.held_bytes_unlocked()
         external_used = max(0, total - free - held)
         paused_sec = max(0.0, self.auto_refill_paused_until - time.monotonic())
+        process_summary = self.gpu_process_summary_unlocked()
         data: dict[str, Any] = {
             "ok": True,
             "device": str(self.device),
@@ -221,6 +311,7 @@ class VramGuardian:
             "external_used_mb": round(external_used / MIB, 2),
             "target_bytes": self.target_bytes_unlocked(),
         }
+        data.update(process_summary)
         if extra:
             data.update(extra)
         return data
@@ -228,6 +319,59 @@ class VramGuardian:
     def status(self) -> dict[str, Any]:
         with self.lock:
             return self.status_unlocked()
+
+    def gpu_process_summary_unlocked(self) -> dict[str, Any]:
+        processes = query_gpu_processes()
+        if not processes:
+            return {
+                "gpu_process_query_ok": False,
+                "guardian_process_used_mb": None,
+                "comfyui_used_mb": None,
+                "other_process_used_mb": None,
+                "gpu_processes": [],
+            }
+
+        guardian_mb = 0.0
+        comfyui_mb = 0.0
+        other_mb = 0.0
+        for process in processes:
+            role = process["role"]
+            used_mb = float(process["used_mb"])
+            if role == "guardian":
+                guardian_mb += used_mb
+            elif role == "comfyui":
+                comfyui_mb += used_mb
+            else:
+                other_mb += used_mb
+
+        return {
+            "gpu_process_query_ok": True,
+            "guardian_process_used_mb": round(guardian_mb, 2),
+            "comfyui_used_mb": round(comfyui_mb, 2),
+            "other_process_used_mb": round(other_mb, 2),
+            "gpu_processes": processes,
+        }
+
+    def format_memory_summary(self, status: dict[str, Any]) -> str:
+        total = float(status.get("total_mb", 0) or 0)
+        free = float(status.get("free_mb", 0) or 0)
+        held = float(status.get("held_mb", 0) or 0)
+        external = float(status.get("external_used_mb", 0) or 0)
+        target = float(status.get("target_bytes", 0) or 0) / MIB
+        paused = float(status.get("auto_refill_paused_sec", 0) or 0)
+
+        if status.get("gpu_process_query_ok"):
+            guardian_proc = float(status.get("guardian_process_used_mb", 0) or 0)
+            comfyui = float(status.get("comfyui_used_mb", 0) or 0)
+            other = float(status.get("other_process_used_mb", 0) or 0)
+            process_bits = f"guardian_proc={guardian_proc:.0f}MiB comfyui={comfyui:.0f}MiB other={other:.0f}MiB"
+        else:
+            process_bits = "guardian_proc=unknown comfyui=unknown other=unknown"
+
+        return (
+            f"total={total:.0f}MiB free={free:.0f}MiB guardian_held={held:.0f}MiB "
+            f"target={target:.0f}MiB external_calc={external:.0f}MiB {process_bits} paused={paused:.0f}s"
+        )
 
 
 class GuardianRequestHandler(socketserver.StreamRequestHandler):
@@ -257,7 +401,10 @@ class GuardianTCPServer(socketserver.ThreadingTCPServer):
         if cmd == "status":
             return self.guardian.status()
         if cmd in {"fill", "reclaim"}:
-            return self.guardian.fill()
+            status = self.guardian.fill()
+            allocated = float(status.get("allocated_bytes", 0) or 0) / MIB
+            LOG.info("%s allocated %.2f MiB | %s", cmd, allocated, self.guardian.format_memory_summary(status))
+            return status
         if cmd in {"release", "release_all"}:
             mb = int(request.get("mb", 0) or 0)
             bytes_to_release = int(request.get("bytes", 0) or 0)
@@ -344,7 +491,9 @@ def main() -> int:
             auto_refill_min_delta_mb=args.auto_refill_min_delta_mb,
         )
     )
-    LOG.info("initial fill: %s", guardian.fill())
+    initial_status = guardian.fill()
+    LOG.info("initial fill: %s", initial_status)
+    LOG.info("memory summary: %s", guardian.format_memory_summary(initial_status))
     guardian.start_auto_refill()
 
     server = GuardianTCPServer((args.host, args.port), guardian)

@@ -105,6 +105,12 @@ bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
 
+Realtime logs include a compact VRAM summary:
+
+```text
+total=45458MiB free=1536MiB guardian_held=32656MiB target=39086MiB external_calc=11266MiB guardian_proc=33126MiB comfyui=2048MiB other=9218MiB paused=0s
+```
+
 For Docker or Compose mode, check status with:
 
 ```bash
@@ -123,6 +129,7 @@ Useful environment variables:
 - `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: minimum newly available amount before auto-refill allocates. Default: `256`.
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin releases Guardian before each node. Default: `false`.
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: pause auto-refill after release so ComfyUI can allocate. Default: `3600`.
+- `VRAM_GUARDIAN_COMFYUI_PID`: optional PID used to classify ComfyUI VRAM in Guardian logs when auto-detection is not enough.
 
 ## Install the ComfyUI plugin
 

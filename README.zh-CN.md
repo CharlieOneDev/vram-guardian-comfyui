@@ -109,6 +109,12 @@ bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
 
+实时日志会显示一行显存摘要：
+
+```text
+total=45458MiB free=1536MiB guardian_held=32656MiB target=39086MiB external_calc=11266MiB guardian_proc=33126MiB comfyui=2048MiB other=9218MiB paused=0s
+```
+
 Docker 或 Compose 模式用下面的命令查看状态：
 
 ```bash
@@ -127,6 +133,7 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: 至少多出多少可占用显存才触发自动补占。默认：`256`。
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI 插件在每个节点执行前先释放 Guardian。默认：`false`。
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 后暂停 auto-refill，给 ComfyUI 留出分配时间。默认：`3600`。
+- `VRAM_GUARDIAN_COMFYUI_PID`: 可选，用于自动识别不准时，指定 ComfyUI PID 以便日志区分 ComfyUI 显存。
 
 ## 安装 ComfyUI 插件
 

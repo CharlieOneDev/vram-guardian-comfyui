@@ -109,6 +109,12 @@ bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
 
+Realtime log には compact な VRAM summary が出ます。
+
+```text
+total=45458MiB free=1536MiB guardian_held=32656MiB target=39086MiB external_calc=11266MiB guardian_proc=33126MiB comfyui=2048MiB other=9218MiB paused=0s
+```
+
 Docker または Compose mode の状態確認:
 
 ```bash
@@ -127,6 +133,7 @@ docker exec vram-guardian python -m vram_guardian.client status --host 127.0.0.1
 - `VRAM_GUARDIAN_AUTO_REFILL_MIN_DELTA_MB`: auto-refill が割り当てを始める最小増分。デフォルト: `256`。
 - `VRAM_GUARDIAN_RELEASE_BEFORE_NODE`: ComfyUI plugin が各 node の実行前に Guardian を解放します。デフォルト: `false`。
 - `VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC`: release 後に auto-refill を一時停止し、ComfyUI が割り当てる時間を確保します。デフォルト: `3600`。
+- `VRAM_GUARDIAN_COMFYUI_PID`: auto-detection が不十分な場合に、ComfyUI VRAM を分類するための任意 PID。
 
 ## ComfyUI プラグインのインストール
 
