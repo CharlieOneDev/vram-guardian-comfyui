@@ -30,10 +30,10 @@ Scheduler mode:
 1. A workflow starts with an automatic base free-VRAM target.
 2. Before a heavy video, sampler, model, VAE, pose, upscale, interpolation, or VSR node runs, the plugin raises the free-VRAM target.
 3. Guardian releases enough held memory before the node starts.
-4. The plugin waits until the target free VRAM is reached, or until a configurable timeout.
+4. The plugin waits until the target free VRAM is reached. For heavy targets, strict precheck is enabled by default: if Guardian has released everything and the target is still unavailable, the node is stopped before execution instead of being allowed to run into a predictable OOM.
 5. During the node, Guardian keeps the higher target and only refills surplus above `target + hysteresis`.
 6. After the node, the high target is removed and Guardian returns to the base target.
-7. If a node OOMs, Guardian fully releases, ComfyUI clears CUDA cache, waits for a higher retry free-VRAM target, retries once, and the profile can bump the next target.
+7. If a node OOMs, Guardian fully releases, ComfyUI clears CUDA cache, waits for a higher retry free-VRAM target, retries once only if that target is reached, and the profile can bump the next target.
 
 ## Important Limits
 
@@ -49,7 +49,7 @@ Scheduler mode:
 VRAM Guardian handles recovery in three layers:
 
 1. Prevention: estimate the node's burst target, release before the node starts, and hold a no-refill lease while heavy nodes run.
-2. Same-process OOM retry: if ComfyUI catches a CUDA OOM, Guardian fully releases, ComfyUI clears unused CUDA cache, the plugin waits for a higher retry target, then retries the node once by default.
+2. Same-process OOM retry: if ComfyUI catches a CUDA OOM, Guardian fully releases, ComfyUI clears unused CUDA cache, the plugin waits for a higher retry target, then retries the node once by default only when enough free VRAM is actually available.
 3. Process restart: if ComfyUI itself crashes, the plugin cannot resume an arbitrary custom node from the middle. A supervisor can restart ComfyUI and requeue a prompt, but true checkpoint resume requires the workflow to write durable intermediate files, such as saved latents, images, or video chunks.
 
 ## Repository Layout
@@ -188,6 +188,8 @@ Default `heavy-video` behavior:
 - Heavy node fallback target is automatic: `min(total_vram * 0.72, 32768 MiB)`.
 - The estimator is enabled by default. It inspects resolved node inputs such as width, height, frames, tensor shapes, tiling, scale, model names, precision, and offload flags, then computes `target_free = estimated_peak_total - current_comfyui_used + margin`.
 - Heavy node leases default to `no-refill`: Guardian may release more memory while the node runs, but it will not reclaim surplus free VRAM until the node exits.
+- Strict heavy-node precheck is enabled by default. If Guardian is already holding `0 MiB` and the target free VRAM still cannot be reached, the plugin asks ComfyUI to unload/cleanup cached models once, then fails the node early instead of entering a long node that is very likely to OOM.
+- Strict OOM retry is enabled by default. After an OOM, the retry only starts if the retry free-VRAM target is reached.
 - Local profiling is enabled by default and writes `vram_guardian_profile.json`.
 - Heavy nodes are detected by broad class-name patterns such as `sampler`, `wan`, `ltx`, `bernini`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, and `model`.
 
@@ -255,6 +257,12 @@ ComfyUI plugin:
 - `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: maximum wait before a node starts. `0` means wait indefinitely.
 - `VRAM_GUARDIAN_WAIT_POLL_SEC`: wait-loop polling interval.
 - `VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC`: repeated wait-log interval.
+- `VRAM_GUARDIAN_STRICT_PRECHECK`: fail heavy nodes before execution if the target free VRAM cannot be reached. Default: `true` under `heavy-video`.
+- `VRAM_GUARDIAN_STRICT_RETRY`: fail an OOM retry if the retry free-VRAM target cannot be reached. Default: `true`.
+- `VRAM_GUARDIAN_STRICT_TARGET_TOLERANCE_MB`: tolerance when comparing current free VRAM to the target. Default: `512`.
+- `VRAM_GUARDIAN_FAIL_FAST_WHEN_EMPTY_SEC`: after Guardian holds `0 MiB`, fail this many seconds later if strict mode is active and free VRAM is still below target. Default: `15`.
+- `VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_WAIT`: when Guardian is empty but target is still not reached, ask ComfyUI to unload/cleanup cached models once before failing. Default: `true` under `heavy-video`.
+- `VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_OOM`: ask ComfyUI to unload/cleanup cached models before an OOM retry. Default: `true`.
 - `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: node runtime sampling interval for profiling.
 - `VRAM_GUARDIAN_PROFILE_ENABLE`: write local profile data. Default: `true` under `heavy-video`.
 - `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON path. Default: `vram_guardian_profile.json`.
@@ -295,6 +303,14 @@ If Guardian has released all held memory and the target is still not available:
 ```text
 [VRAM Scheduler] WanVideoSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
 ```
+
+In strict mode, the next error is intentional:
+
+```text
+VRAM Guardian could not reach 36352MiB free for WanVideoSampler#12: free=5147MiB guardian_held=0MiB other_process=0MiB reason=guardian-empty
+```
+
+It means Guardian has nothing left to release. Reduce the workflow memory requirement, stop other GPU processes, unload ComfyUI models, lower the target, or move the job to a less crowded GPU.
 
 ## Tuning Notes
 

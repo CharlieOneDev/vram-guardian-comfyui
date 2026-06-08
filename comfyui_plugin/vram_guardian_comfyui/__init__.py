@@ -133,6 +133,12 @@ SCHEDULER_WAIT_TIMEOUT = _env_float("VRAM_GUARDIAN_WAIT_TIMEOUT_SEC", 120.0)
 SCHEDULER_WAIT_POLL = _env_float("VRAM_GUARDIAN_WAIT_POLL_SEC", 0.5)
 SCHEDULER_LOG_INTERVAL = _env_float("VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC", 5.0)
 SCHEDULER_MONITOR_INTERVAL = _env_float("VRAM_GUARDIAN_MONITOR_INTERVAL_SEC", 0.5)
+STRICT_PRECHECK = _env_bool("VRAM_GUARDIAN_STRICT_PRECHECK", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
+STRICT_RETRY = _env_bool("VRAM_GUARDIAN_STRICT_RETRY", True)
+STRICT_TARGET_TOLERANCE_MB = _env_int("VRAM_GUARDIAN_STRICT_TARGET_TOLERANCE_MB", 512)
+FAIL_FAST_WHEN_EMPTY_SEC = _env_float("VRAM_GUARDIAN_FAIL_FAST_WHEN_EMPTY_SEC", 15.0)
+COMFYUI_CLEANUP_ON_WAIT = _env_bool("VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_WAIT", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
+COMFYUI_CLEANUP_ON_OOM = _env_bool("VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_OOM", True)
 ESTIMATOR_ENABLE = _env_bool("VRAM_GUARDIAN_ESTIMATOR_ENABLE", SCHEDULER_ENABLE and SCHEDULER_AUTO_PRESET)
 ESTIMATOR_MARGIN_MB = _env_int("VRAM_GUARDIAN_ESTIMATOR_MARGIN_MB", 2048)
 ESTIMATOR_MIN_TARGET_MB = _env_int("VRAM_GUARDIAN_ESTIMATOR_MIN_TARGET_MB", 0)
@@ -153,6 +159,10 @@ _PROMPT_SCOPE_PATCHED = False
 _PROFILE_LOCK = threading.RLock()
 _PROFILE_DATA: dict[str, Any] = {}
 _TOTAL_MB_CACHE: float | None = None
+
+
+class VramGuardianInsufficientFreeError(RuntimeError):
+    pass
 
 
 def _guardian_request(cmd: str, **fields: Any) -> dict[str, Any] | None:
@@ -300,6 +310,31 @@ def _local_cuda_cleanup() -> None:
         torch.cuda.ipc_collect()
     except Exception:
         LOG.debug("local CUDA cleanup failed", exc_info=True)
+
+
+def _comfyui_memory_cleanup(label: str, reason: str) -> None:
+    LOG.info("[VRAM Scheduler] requesting ComfyUI memory cleanup for %s: %s", label, reason)
+    called: list[str] = []
+    try:
+        from comfy import model_management  # type: ignore
+    except Exception as exc:
+        LOG.warning("[VRAM Scheduler] ComfyUI model_management import failed for %s: %s", label, exc)
+        _local_cuda_cleanup()
+        return
+
+    for name in ("unload_all_models", "cleanup_models", "soft_empty_cache"):
+        func = getattr(model_management, name, None)
+        if not callable(func):
+            continue
+        try:
+            func()
+            called.append(name)
+        except TypeError:
+            LOG.debug("[VRAM Scheduler] ComfyUI cleanup function %s has incompatible signature", name, exc_info=True)
+        except Exception as exc:
+            LOG.warning("[VRAM Scheduler] ComfyUI cleanup function %s failed for %s: %s", name, label, exc)
+    _local_cuda_cleanup()
+    LOG.info("[VRAM Scheduler] ComfyUI memory cleanup for %s finished: %s", label, ",".join(called) or "local-only")
 
 
 def _is_oom(exc: BaseException) -> bool:
@@ -849,22 +884,67 @@ def _status_comfyui_used_mb(status: dict[str, Any] | None) -> float:
     return max(values) if values else 0.0
 
 
-def _wait_for_free_mb(label: str, target_free_mb: int) -> dict[str, Any] | None:
+def _target_free_reached(status: dict[str, Any] | None, target_free_mb: int) -> bool:
+    return _status_free_mb(status) + max(0, STRICT_TARGET_TOLERANCE_MB) >= target_free_mb
+
+
+def _strict_precheck_enabled(target_free_mb: int, target_source: str) -> bool:
+    if not STRICT_PRECHECK:
+        return False
+    if target_source in {"base", "legacy-active", "disabled", "none"}:
+        return False
+    base_target = _base_free_target_mb()
+    return target_free_mb > base_target + max(512, ACTIVE_HYSTERESIS_MB)
+
+
+def _raise_insufficient_free(label: str, target_free_mb: int, status: dict[str, Any] | None, reason: str) -> None:
+    free_mb = _status_free_mb(status)
+    held_mb = _status_held_mb(status)
+    other_mb = 0.0
+    if status:
+        try:
+            other_mb = float(status.get("other_process_used_mb", 0) or 0)
+        except (TypeError, ValueError):
+            other_mb = 0.0
+    raise VramGuardianInsufficientFreeError(
+        f"VRAM Guardian could not reach {target_free_mb}MiB free for {label}: "
+        f"free={free_mb:.0f}MiB guardian_held={held_mb:.0f}MiB other_process={other_mb:.0f}MiB reason={reason}. "
+        "The Guardian has no more reserved VRAM to release; unload models, stop other GPU processes, "
+        "lower the workflow memory requirement, or reduce the target."
+    )
+
+
+def _wait_for_free_mb(
+    label: str,
+    target_free_mb: int,
+    *,
+    strict: bool = False,
+    cleanup: bool = False,
+) -> dict[str, Any] | None:
     if target_free_mb <= 0:
         return _guardian_status()
 
     deadline = None if SCHEDULER_WAIT_TIMEOUT <= 0 else time.monotonic() + SCHEDULER_WAIT_TIMEOUT
     next_log = 0.0
+    empty_since: float | None = None
+    cleanup_done = False
     status = _ensure_guardian_free(target_free_mb)
 
     while True:
         free_mb = _status_free_mb(status)
-        if free_mb >= target_free_mb:
+        if _target_free_reached(status, target_free_mb):
             LOG.info("[VRAM Scheduler] %s free reached %.0fMiB target=%sMiB; continuing", label, free_mb, target_free_mb)
+            if status is not None:
+                status["wait_reached"] = True
             return status
 
         now = time.monotonic()
         held_mb = _status_held_mb(status)
+        if held_mb <= 0:
+            empty_since = now if empty_since is None else empty_since
+        else:
+            empty_since = None
+
         if now >= next_log:
             LOG.info(
                 "[VRAM Scheduler] %s waiting: free=%.0fMiB target=%sMiB guardian_held=%.0fMiB",
@@ -880,6 +960,30 @@ def _wait_for_free_mb(label: str, target_free_mb: int) -> dict[str, Any] | None:
                 )
             next_log = now + max(1.0, SCHEDULER_LOG_INTERVAL)
 
+        if cleanup and not cleanup_done and held_mb <= 0:
+            cleanup_done = True
+            _comfyui_memory_cleanup(label, f"free {free_mb:.0f}MiB below target {target_free_mb}MiB with Guardian held 0MiB")
+            status = _ensure_guardian_free(target_free_mb)
+            continue
+
+        if (
+            strict
+            and FAIL_FAST_WHEN_EMPTY_SEC > 0
+            and empty_since is not None
+            and now - empty_since >= FAIL_FAST_WHEN_EMPTY_SEC
+        ):
+            if status is not None:
+                status["wait_reached"] = False
+                status["wait_failed_reason"] = "guardian-empty"
+            LOG.warning(
+                "[VRAM Scheduler] %s strict wait cannot progress: free=%.0fMiB target=%sMiB guardian_held=%.0fMiB",
+                label,
+                free_mb,
+                target_free_mb,
+                held_mb,
+            )
+            _raise_insufficient_free(label, target_free_mb, status, "guardian-empty")
+
         if deadline is not None and now >= deadline:
             LOG.warning(
                 "[VRAM Scheduler] %s wait timed out after %.1fs: free=%.0fMiB target=%sMiB",
@@ -888,6 +992,11 @@ def _wait_for_free_mb(label: str, target_free_mb: int) -> dict[str, Any] | None:
                 free_mb,
                 target_free_mb,
             )
+            if status is not None:
+                status["wait_reached"] = False
+                status["wait_failed_reason"] = "timeout"
+            if strict:
+                _raise_insufficient_free(label, target_free_mb, status, "timeout")
             return status
 
         time.sleep(max(0.05, SCHEDULER_WAIT_POLL))
@@ -928,10 +1037,17 @@ def _oom_retry_target_mb(label: str, current_target_mb: int) -> int:
 
 def _prepare_oom_retry(label: str, current_target_mb: int) -> None:
     _release_guardian()
+    if COMFYUI_CLEANUP_ON_OOM:
+        _comfyui_memory_cleanup(label, "CUDA OOM before retry")
     _local_cuda_cleanup()
     retry_target = _oom_retry_target_mb(label, current_target_mb)
     if retry_target > 0:
-        _wait_for_free_mb(f"{label} OOM retry", retry_target)
+        _wait_for_free_mb(
+            f"{label} OOM retry",
+            retry_target,
+            strict=STRICT_RETRY,
+            cleanup=COMFYUI_CLEANUP_ON_WAIT,
+        )
 
 
 class SchedulerRun:
@@ -1176,7 +1292,12 @@ def _install_get_output_data_patch() -> None:
                 try:
                     if active_scheduler and not full_release_retry:
                         token = _begin_watermark(label, target_free_mb, allow_refill=allow_refill)
-                        status = _wait_for_free_mb(label, target_free_mb)
+                        status = _wait_for_free_mb(
+                            label,
+                            target_free_mb,
+                            strict=_strict_precheck_enabled(target_free_mb, target_source),
+                            cleanup=COMFYUI_CLEANUP_ON_WAIT,
+                        )
                         run = SchedulerRun(label, class_name, node_id, target_free_mb, input_signature)
                         run.start(status)
                     elif active_scheduler and full_release_retry:
@@ -1280,7 +1401,12 @@ def _install_get_output_data_patch() -> None:
             try:
                 if active_scheduler and not full_release_retry:
                     token = _begin_watermark(label, target_free_mb, allow_refill=allow_refill)
-                    status = _wait_for_free_mb(label, target_free_mb)
+                    status = _wait_for_free_mb(
+                        label,
+                        target_free_mb,
+                        strict=_strict_precheck_enabled(target_free_mb, target_source),
+                        cleanup=COMFYUI_CLEANUP_ON_WAIT,
+                    )
                     run = SchedulerRun(label, class_name, node_id, target_free_mb, input_signature)
                     run.start(status)
                 elif active_scheduler and full_release_retry:
@@ -1383,7 +1509,9 @@ def _install() -> None:
         status = _guardian_request("status")
         LOG.info(
             "VRAM Guardian scheduler config: enabled=%s preset=%s base_free=%sMiB heavy_free=%sMiB "
-            "estimator=%s estimator_margin=%sMiB heavy_refill_mode=%s profile=%s heavy_patterns=%s node_map=%s",
+            "estimator=%s estimator_margin=%sMiB heavy_refill_mode=%s strict_precheck=%s strict_retry=%s "
+            "target_tolerance=%sMiB fail_fast_empty=%ss cleanup_on_wait=%s cleanup_on_oom=%s profile=%s "
+            "heavy_patterns=%s node_map=%s",
             SCHEDULER_ENABLE,
             SCHEDULER_PRESET,
             _base_free_target_mb(status),
@@ -1391,6 +1519,12 @@ def _install() -> None:
             ESTIMATOR_ENABLE,
             ESTIMATOR_MARGIN_MB,
             HEAVY_REFILL_MODE,
+            STRICT_PRECHECK,
+            STRICT_RETRY,
+            STRICT_TARGET_TOLERANCE_MB,
+            FAIL_FAST_WHEN_EMPTY_SEC,
+            COMFYUI_CLEANUP_ON_WAIT,
+            COMFYUI_CLEANUP_ON_OOM,
             PROFILE_ENABLE,
             ",".join(sorted(HEAVY_PATTERNS)) or "-",
             ",".join(sorted(NODE_FREE_MAP)) or "-",

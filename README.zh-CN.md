@@ -14,7 +14,7 @@ VRAM Guardian for ComfyUI 是一个实验性的显存保留与调度工具，适
 - 重节点执行前提高目标空闲显存，并等待 Guardian 释放到位。
 - 重节点执行中保持高水位，避免中途回填过猛导致后半段 OOM。
 - 节点结束后恢复基础水位并回填。
-- OOM 后全释放、清理 CUDA cache、等待更高的 retry 空闲显存目标、重试一次，并可提高该节点下次预算。
+- OOM 后全释放、清理 CUDA cache、等待更高的 retry 空闲显存目标；只有 retry 目标真正达成时才重试，并可提高该节点下次预算。
 - 可选本地 profiling，记录节点显存行为。
 
 ## 重要限制
@@ -39,7 +39,7 @@ VRAM Guardian for ComfyUI 是一个实验性的显存保留与调度工具，适
 VRAM Guardian 分三层处理故障：
 
 1. 预防：估算节点突发显存目标，在节点开始前释放，并在重节点运行期间保持 no-refill lease。
-2. 同进程 OOM retry：如果 ComfyUI 捕获到 CUDA OOM，Guardian 会全释放，ComfyUI 清理未使用的 CUDA cache，插件等待更高的 retry 目标，然后默认重试该节点一次。
+2. 同进程 OOM retry：如果 ComfyUI 捕获到 CUDA OOM，Guardian 会全释放，ComfyUI 清理未使用的 CUDA cache，插件等待更高的 retry 目标；只有空闲显存真的达到目标时，才默认重试该节点一次。
 3. 进程重启：如果 ComfyUI 进程本身崩溃，插件无法从任意 custom node 的中途恢复。外部 supervisor 可以重启 ComfyUI 并重新排队 prompt，但真正的断点续跑需要工作流主动写入可持久化中间文件，例如 latent、图片或视频分段。
 
 ## 项目结构
@@ -178,6 +178,8 @@ python main.py
 - 重节点 fallback 空闲显存目标自动计算：`min(total_vram * 0.72, 32768 MiB)`。
 - Estimator 默认启用。它会读取节点已解析输入，例如宽、高、帧数、tensor shape、tiling、scale、模型名、精度和 offload 标记，然后计算 `target_free = estimated_peak_total - current_comfyui_used + margin`。
 - 重节点 lease 默认是 `no-refill`：节点运行期间 Guardian 可以继续释放显存，但不会主动把多余 free 显存占回去，直到该节点结束。
+- 严格重节点预检默认启用。如果 Guardian 已经只剩 `0 MiB` 可释放，而目标 free 仍然达不到，插件会先让 ComfyUI 尝试卸载和清理缓存模型一次；仍然不够时会提前停止该节点，避免进入长节点后再 OOM。
+- 严格 OOM retry 默认启用。发生 OOM 后，只有 retry 空闲显存目标已经达到，插件才会启动 retry。
 - 本地 profiling 默认启用，写入 `vram_guardian_profile.json`。
 - 重节点通过宽泛 class-name 模糊匹配识别，例如 `sampler`、`wan`、`ltx`、`bernini`、`vsr`、`upscale`、`interpol`、`decode`、`vae`、`pose`、`model`。
 
@@ -221,7 +223,7 @@ python main.py
 4. 如果 estimator 可以根据节点输入估算峰值，则优先使用估算出的 target free。
 5. 如果节点 class 在 `HEAVY_NODES` 中，或命中 `HEAVY_PATTERNS`，但参数不足以估算，则使用 `HEAVY_FREE_MB`。
 6. 节点执行前，插件调用 Guardian 的 `ensure_free`，让 Guardian 释放到目标 free。
-7. 如果 free 不够，插件会等待，并周期性打印日志。
+7. 如果 free 不够，插件会等待，并周期性打印日志；对于重节点，默认严格预检，Guardian 已经放空但目标仍达不到时会提前失败。
 8. 重节点运行中默认 no-refill，Guardian 只释放不回填。
 9. 节点完成后，高水位 token 关闭，Guardian 回到 base 水位。
 10. prompt 结束后，Guardian 回到正常防抢占状态。
@@ -260,6 +262,12 @@ ComfyUI 插件：
 - `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: 节点开始前最长等待时间，`0` 表示无限等待。
 - `VRAM_GUARDIAN_WAIT_POLL_SEC`: 等待轮询间隔。
 - `VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC`: 等待日志间隔。
+- `VRAM_GUARDIAN_STRICT_PRECHECK`: 重节点执行前如果目标 free 达不到就提前失败。`heavy-video` 下默认 `true`。
+- `VRAM_GUARDIAN_STRICT_RETRY`: OOM retry 前如果 retry 目标 free 达不到就失败。默认 `true`。
+- `VRAM_GUARDIAN_STRICT_TARGET_TOLERANCE_MB`: 判断 free 是否达到目标时允许的容差。默认 `512`。
+- `VRAM_GUARDIAN_FAIL_FAST_WHEN_EMPTY_SEC`: Guardian 已经只剩 `0 MiB` 可释放后，严格模式继续等这么多秒仍未达标就失败。默认 `15`。
+- `VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_WAIT`: Guardian 放空但目标仍未达成时，让 ComfyUI 尝试卸载和清理缓存模型一次。`heavy-video` 下默认 `true`。
+- `VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_OOM`: OOM retry 前让 ComfyUI 尝试卸载和清理缓存模型。默认 `true`。
 - `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: 节点运行期间采样间隔。
 - `VRAM_GUARDIAN_PROFILE_ENABLE`: 启用本地 profile，`heavy-video` 下默认启用。
 - `VRAM_GUARDIAN_PROFILE_PATH`: profile JSON 路径，默认 `vram_guardian_profile.json`。
@@ -291,6 +299,14 @@ Scheduler 日志示例：
 ```text
 [VRAM Scheduler] WanVideoSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
 ```
+
+严格模式下，随后看到这个错误是预期行为：
+
+```text
+VRAM Guardian could not reach 36352MiB free for WanVideoSampler#12: free=5147MiB guardian_held=0MiB other_process=0MiB reason=guardian-empty
+```
+
+它表示 Guardian 已经没有更多显存可以释放。需要降低工作流显存需求、停止其他 GPU 进程、卸载 ComfyUI 已缓存模型、降低 target，或换到更空闲的 GPU。
 
 ## 调参建议
 

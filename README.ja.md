@@ -23,7 +23,7 @@ Guardian プロセスが CUDA tensor で VRAM を保持し、ComfyUI プラグ�
 - node 開始前に release と wait を行う。
 - node 実行中に target free VRAM watermark を維持する。
 - node 終了後に base watermark に戻す。
-- OOM 後に release、CUDA cache cleanup、高めの retry free target への wait、retry を行う。
+- OOM 後に release、CUDA cache cleanup、高めの retry free target への wait を行い、target に届いた場合だけ retry する。
 
 できないこと:
 
@@ -36,7 +36,7 @@ Guardian プロセスが CUDA tensor で VRAM を保持し、ComfyUI プラグ�
 VRAM Guardian は recovery を 3 層で扱います:
 
 1. Prevention: node の burst target を推定し、node 開始前に release し、重い node の実行中は no-refill lease を維持します。
-2. Same-process OOM retry: ComfyUI が CUDA OOM を捕捉できた場合、Guardian は全 release し、ComfyUI は unused CUDA cache を cleanup し、plugin は高めの retry target まで wait してから node をデフォルト 1 回 retry します。
+2. Same-process OOM retry: ComfyUI が CUDA OOM を捕捉できた場合、Guardian は全 release し、ComfyUI は unused CUDA cache を cleanup し、plugin は高めの retry target まで wait します。十分な free VRAM に届いた場合だけ、node をデフォルト 1 回 retry します。
 3. Process restart: ComfyUI process 自体が crash した場合、plugin は任意の custom node の途中から resume できません。supervisor で ComfyUI を再起動して prompt を requeue することはできますが、本当の checkpoint resume には latent、image、video chunk などの durable intermediate file を workflow 側で保存する必要があります。
 
 ## Guardian の起動
@@ -143,6 +143,8 @@ Default `heavy-video` behavior:
 - heavy node fallback target は自動計算: `min(total_vram * 0.72, 32768 MiB)`。
 - estimator はデフォルトで有効です。resolved node input から width、height、frames、tensor shape、tiling、scale、model name、precision、offload flag を読み、`target_free = estimated_peak_total - current_comfyui_used + margin` を計算します。
 - heavy node lease はデフォルトで `no-refill` です。node 実行中 Guardian は追加 release できますが、node 終了まで余った free VRAM を reclaim しません。
+- strict heavy-node precheck はデフォルトで有効です。Guardian がすでに `0 MiB` しか保持しておらず target free VRAM に届かない場合、plugin は ComfyUI に cached model の unload/cleanup を一度依頼し、それでも足りなければ node 実行前に失敗させます。
+- strict OOM retry はデフォルトで有効です。OOM 後の retry は、retry free-VRAM target に届いた場合だけ開始されます。
 - local profiling はデフォルトで有効で、`vram_guardian_profile.json` に書き込みます。
 - heavy node は `sampler`, `wan`, `ltx`, `bernini`, `vsr`, `upscale`, `interpol`, `decode`, `vae`, `pose`, `model` などの class-name pattern で検出されます。
 
@@ -177,7 +179,7 @@ export VRAM_GUARDIAN_SCHEDULER_PRESET=manual
 3. `NODE_FREE_MAP` に一致する node は、その target free VRAM まで Guardian を release します。
 4. estimator が node input から peak を推定できる場合、その target free を優先します。
 5. `HEAVY_NODES` または `HEAVY_PATTERNS` に一致し、推定に必要な情報が不足する node は `HEAVY_FREE_MB` を使用します。
-6. node 実行前、plugin は `ensure_free` を呼び、target に届くまで wait します。
+6. node 実行前、plugin は `ensure_free` を呼び、target に届くまで wait します。heavy node では strict precheck がデフォルトで有効です。
 7. heavy node 実行中はデフォルト no-refill で、Guardian は release のみ行います。
 8. node 終了後、高い watermark を閉じ、base watermark に戻します。
 9. prompt 終了後、Guardian は通常の予約状態に戻ります。
@@ -212,6 +214,14 @@ ComfyUI plugin:
 - `VRAM_GUARDIAN_HEAVY_PATTERNS`: comma-separated lowercase class-name substrings。`heavy-video` では video workflow 用 pattern がデフォルト。
 - `VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB`: refill hysteresis。
 - `VRAM_GUARDIAN_WAIT_TIMEOUT_SEC`: node 開始前の最大 wait。
+- `VRAM_GUARDIAN_WAIT_POLL_SEC`: wait loop polling interval。
+- `VRAM_GUARDIAN_WAIT_LOG_INTERVAL_SEC`: repeated wait log interval。
+- `VRAM_GUARDIAN_STRICT_PRECHECK`: heavy node 実行前に target free VRAM に届かない場合は失敗させます。`heavy-video` ではデフォルト `true`。
+- `VRAM_GUARDIAN_STRICT_RETRY`: OOM retry 前に retry free-VRAM target に届かない場合は失敗させます。デフォルト `true`。
+- `VRAM_GUARDIAN_STRICT_TARGET_TOLERANCE_MB`: target 到達判定の tolerance。デフォルト `512`。
+- `VRAM_GUARDIAN_FAIL_FAST_WHEN_EMPTY_SEC`: Guardian の保持量が `0 MiB` になった後、strict mode でこの秒数だけ待っても target に届かない場合は失敗します。デフォルト `15`。
+- `VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_WAIT`: Guardian が空でも target に届かない場合、ComfyUI に cached model の unload/cleanup を一度依頼します。`heavy-video` ではデフォルト `true`。
+- `VRAM_GUARDIAN_COMFYUI_CLEANUP_ON_OOM`: OOM retry 前に ComfyUI に cached model の unload/cleanup を依頼します。デフォルト `true`。
 - `VRAM_GUARDIAN_MONITOR_INTERVAL_SEC`: runtime sampling interval。
 - `VRAM_GUARDIAN_PROFILE_ENABLE`: local profile JSON を書き込む。`heavy-video` ではデフォルト有効。
 - `VRAM_GUARDIAN_PROFILE_MARGIN_MB`: learned target の margin。
@@ -241,6 +251,14 @@ Guardian がすべて release しても target に届かない場合:
 ```text
 [VRAM Scheduler] WanVideoSampler#12 Guardian holds no VRAM but free is still below target; another process may be using the GPU
 ```
+
+strict mode では、続くこの error は意図した動作です:
+
+```text
+VRAM Guardian could not reach 36352MiB free for WanVideoSampler#12: free=5147MiB guardian_held=0MiB other_process=0MiB reason=guardian-empty
+```
+
+Guardian にもう release できる VRAM が残っていないという意味です。workflow の memory requirement を下げる、他の GPU process を止める、ComfyUI の cached model を unload する、target を下げる、または空いている GPU に移す必要があります。
 
 ## Tuning
 
