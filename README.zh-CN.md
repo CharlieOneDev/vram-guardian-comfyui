@@ -108,20 +108,27 @@ docker run -d \
 ### 方式 C：直接 Python
 
 适合 CNB、WSL2、云容器或无法嵌套 GPU Docker 的环境。
+如果 ComfyUI 使用单独 Python 环境，Guardian 也应该使用同一个 Python。CNB 示例：
 
 ```bash
 cd vram-guardian-comfyui
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+export PYTHON_BIN=/workspace/venv312/bin/python
+
+$PYTHON_BIN -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
 
 常用命令：
 
 ```bash
+export PYTHON_BIN=/workspace/venv312/bin/python
+
 bash scripts/guardian_direct.sh status
 bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
+
+如果你的 ComfyUI 环境不是 `/workspace/venv312`，把 `PYTHON_BIN` 改成实际 Python 路径。
 
 直接模式会生成：
 

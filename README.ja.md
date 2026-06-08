@@ -84,18 +84,25 @@ docker run -d \
 ### Direct Python
 
 Nested GPU Docker が使えない環境では、ComfyUI と同じ Linux/WSL2/cloud container で直接起動します。
+ComfyUI が virtual environment を使っている場合は、Guardian も同じ Python interpreter を使います。CNB 例:
 
 ```bash
 cd vram-guardian-comfyui
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+export PYTHON_BIN=/workspace/venv312/bin/python
+
+$PYTHON_BIN -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
 
 ```bash
+export PYTHON_BIN=/workspace/venv312/bin/python
+
 bash scripts/guardian_direct.sh status
 bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
+
+ComfyUI environment が別の場所にある場合は、`PYTHON_BIN` を実際の Python path に変更してください。
 
 ## ComfyUI プラグインのインストール
 

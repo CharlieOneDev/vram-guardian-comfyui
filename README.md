@@ -118,20 +118,27 @@ If Docker fails during NVIDIA runtime initialization, run Guardian directly in t
 ### Option C: Direct Python
 
 Use this when nested GPU Docker is unavailable or unreliable.
+If ComfyUI runs in a virtual environment, run Guardian with the same Python interpreter. CNB-style example:
 
 ```bash
 cd vram-guardian-comfyui
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+export PYTHON_BIN=/workspace/venv312/bin/python
+
+$PYTHON_BIN -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 VRAM_GUARDIAN_FRACTION=0.82 bash scripts/guardian_direct.sh start
 ```
 
 Common direct-mode commands:
 
 ```bash
+export PYTHON_BIN=/workspace/venv312/bin/python
+
 bash scripts/guardian_direct.sh status
 bash scripts/guardian_direct.sh logs
 bash scripts/guardian_direct.sh stop
 ```
+
+Change `/workspace/venv312/bin/python` if your ComfyUI environment uses a different interpreter.
 
 Direct mode writes:
 
