@@ -110,11 +110,11 @@ def compact_command(command: str, limit: int = 160) -> str:
 @dataclass
 class GuardianConfig:
     device: str = "cuda:0"
-    fraction: float = 0.82
-    min_free_mb: int = 1536
+    fraction: float = 0.98
+    min_free_mb: int = 0
     chunk_mb: int = 256
     max_hold_mb: int = 0
-    auto_refill: bool = True
+    auto_refill: bool = False
     auto_refill_interval_sec: float = 5.0
     auto_refill_min_delta_mb: int = 256
     watermark_mode: bool = False
@@ -170,10 +170,16 @@ class VramGuardian:
         free, total = torch.cuda.mem_get_info(self.device)
         return int(free), int(total)
 
-    def target_bytes_unlocked(self) -> int:
+    def target_used_bytes_unlocked(self) -> int:
         _, total = self.mem_info_unlocked()
         target = int(total * max(0.0, min(0.98, self.config.fraction)))
-        target = min(target, max(0, total - self.config.min_free_bytes))
+        return min(target, max(0, total - self.config.min_free_bytes))
+
+    def target_bytes_unlocked(self) -> int:
+        free, total = self.mem_info_unlocked()
+        held = self.held_bytes_unlocked()
+        external_used = max(0, total - free - held)
+        target = max(0, self.target_used_bytes_unlocked() - external_used)
         if self.config.max_hold_bytes > 0:
             target = min(target, self.config.max_hold_bytes)
         return max(0, target)
@@ -222,6 +228,62 @@ class VramGuardian:
                 self.config.chunk_mb = max(16, self.config.chunk_mb // 2)
                 LOG.warning("OOM while filling; reducing chunk size to %s MiB", self.config.chunk_mb)
         return allocated
+
+    def reserve_bytes_unlocked(self, bytes_to_reserve: int, min_free_bytes: int) -> int:
+        allocated = 0
+        attempts = 0
+        while allocated < bytes_to_reserve:
+            held = self.held_bytes_unlocked()
+            free, _ = self.mem_info_unlocked()
+            target = self.target_bytes_unlocked()
+            available_to_take = free - min_free_bytes
+            remaining = bytes_to_reserve - allocated
+            remaining_to_target = target - held
+            remaining_hold = self.config.max_hold_bytes - held if self.config.max_hold_bytes > 0 else remaining
+
+            if remaining <= 0 or remaining_to_target <= 0 or remaining_hold <= 0 or available_to_take < 16 * MIB:
+                break
+
+            size = min(self.config.chunk_bytes, remaining, remaining_to_target, remaining_hold, available_to_take)
+            size = int(size // MIB) * MIB
+            if size < 16 * MIB:
+                break
+
+            chunk = None
+            try:
+                chunk = torch.empty(size, dtype=torch.uint8, device=self.device)
+                chunk.zero_()
+                torch.cuda.synchronize(self.device)
+                self.chunks.append(chunk)
+                allocated += size
+                attempts = 0
+            except torch.cuda.OutOfMemoryError:
+                if chunk is not None:
+                    del chunk
+                attempts += 1
+                torch.cuda.empty_cache()
+                if attempts >= 3 or size <= 16 * MIB:
+                    break
+                self.config.chunk_mb = max(16, self.config.chunk_mb // 2)
+                LOG.warning("OOM while reserving; reducing chunk size to %s MiB", self.config.chunk_mb)
+        return allocated
+
+    def reserve(self, bytes_to_reserve: int) -> dict[str, Any]:
+        with self.lock:
+            if bytes_to_reserve <= 0:
+                allocated = self.fill_preserving_free_unlocked(self.config.min_free_bytes)
+                command = "fill"
+            else:
+                allocated = self.reserve_bytes_unlocked(bytes_to_reserve, self.config.min_free_bytes)
+                command = "reserve"
+            status = self.status_unlocked(extra={"allocated_bytes": allocated, "manual_command": command})
+            LOG.info(
+                "%s allocated %.2f MiB | %s",
+                command,
+                allocated / MIB,
+                self.format_memory_summary(status),
+            )
+            return status
 
     def release_bytes_unlocked(self, bytes_to_release: int = 0) -> int:
         released = 0
@@ -485,6 +547,8 @@ class VramGuardian:
         external_used = max(0, total - free - held)
         paused_sec = max(0.0, self.auto_refill_paused_until - time.monotonic())
         process_summary = self.gpu_process_summary_unlocked()
+        target_used = self.target_used_bytes_unlocked()
+        target = self.target_bytes_unlocked()
         data: dict[str, Any] = {
             "ok": True,
             "device": str(self.device),
@@ -512,7 +576,10 @@ class VramGuardian:
             "total_mb": round(total / MIB, 2),
             "external_used_bytes": external_used,
             "external_used_mb": round(external_used / MIB, 2),
-            "target_bytes": self.target_bytes_unlocked(),
+            "target_used_bytes": target_used,
+            "target_used_mb": round(target_used / MIB, 2),
+            "target_bytes": target,
+            "target_mb": round(target / MIB, 2),
         }
         data.update(process_summary)
         if extra:
@@ -603,11 +670,12 @@ class GuardianTCPServer(socketserver.ThreadingTCPServer):
             return {"ok": True, "pong": True}
         if cmd == "status":
             return self.guardian.status()
-        if cmd in {"fill", "reclaim"}:
-            status = self.guardian.fill()
-            allocated = float(status.get("allocated_bytes", 0) or 0) / MIB
-            LOG.info("%s allocated %.2f MiB | %s", cmd, allocated, self.guardian.format_memory_summary(status))
-            return status
+        if cmd in {"fill", "reclaim", "reserve", "occupy", "hold", "allocate"}:
+            mb = int(request.get("mb", 0) or 0)
+            bytes_to_reserve = int(request.get("bytes", 0) or 0)
+            if mb > 0:
+                bytes_to_reserve = mb * MIB
+            return self.guardian.reserve(bytes_to_reserve)
         if cmd in {"release", "release_all"}:
             mb = int(request.get("mb", 0) or 0)
             bytes_to_release = int(request.get("bytes", 0) or 0)
@@ -666,15 +734,15 @@ def env_bool(name: str, default: bool) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Reserve CUDA VRAM and release it on demand")
+    parser = argparse.ArgumentParser(description="Reserve CUDA VRAM and release or reclaim it on demand")
     parser.add_argument("--host", default=os.getenv("VRAM_GUARDIAN_HOST", "0.0.0.0"))
     parser.add_argument("--port", default=env_int("VRAM_GUARDIAN_PORT", 8765), type=int)
     parser.add_argument("--device", default=os.getenv("VRAM_GUARDIAN_DEVICE", "cuda:0"))
-    parser.add_argument("--fraction", default=env_float("VRAM_GUARDIAN_FRACTION", 0.82), type=float)
-    parser.add_argument("--min-free-mb", default=env_int("VRAM_GUARDIAN_MIN_FREE_MB", 1536), type=int)
+    parser.add_argument("--fraction", default=env_float("VRAM_GUARDIAN_FRACTION", 0.98), type=float)
+    parser.add_argument("--min-free-mb", default=env_int("VRAM_GUARDIAN_MIN_FREE_MB", 0), type=int)
     parser.add_argument("--chunk-mb", default=env_int("VRAM_GUARDIAN_CHUNK_MB", 256), type=int)
     parser.add_argument("--max-hold-mb", default=env_int("VRAM_GUARDIAN_MAX_HOLD_MB", 0), type=int)
-    parser.add_argument("--auto-refill", default=env_bool("VRAM_GUARDIAN_AUTO_REFILL", True), type=env_bool_arg)
+    parser.add_argument("--auto-refill", default=env_bool("VRAM_GUARDIAN_AUTO_REFILL", False), type=env_bool_arg)
     parser.add_argument(
         "--auto-refill-interval-sec",
         default=env_float("VRAM_GUARDIAN_AUTO_REFILL_INTERVAL_SEC", 5.0),

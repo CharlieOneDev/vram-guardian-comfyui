@@ -75,6 +75,7 @@ def _env_int_map(name: str) -> dict[str, int]:
 
 
 ENABLED = _env_bool("VRAM_GUARDIAN_ENABLED", True)
+AUTOMATION_ENABLED = _env_bool("VRAM_GUARDIAN_COMFYUI_AUTOMATION", False)
 HOST = os.getenv("VRAM_GUARDIAN_HOST", "127.0.0.1")
 PORT = _env_int("VRAM_GUARDIAN_PORT", 8765)
 TIMEOUT = _env_float("VRAM_GUARDIAN_TIMEOUT_SEC", 2.0)
@@ -83,13 +84,13 @@ RELEASE_MB = _env_int("VRAM_GUARDIAN_RELEASE_MB", 0)
 RELEASE_REFILL_PAUSE = _env_float("VRAM_GUARDIAN_RELEASE_REFILL_PAUSE_SEC", 3600.0)
 RELEASE_BEFORE_NODE = _env_bool("VRAM_GUARDIAN_RELEASE_BEFORE_NODE", False)
 RETRY_SLEEP = _env_float("VRAM_GUARDIAN_RETRY_SLEEP_SEC", 0.5)
-RECLAIM_ON_SUCCESS = _env_bool("VRAM_GUARDIAN_RECLAIM_ON_SUCCESS", True)
+RECLAIM_ON_SUCCESS = _env_bool("VRAM_GUARDIAN_RECLAIM_ON_SUCCESS", False)
 RECLAIM_DELAY = _env_float("VRAM_GUARDIAN_RECLAIM_DELAY_SEC", 0.0)
 ACTIVE_FREE_MB = _env_int("VRAM_GUARDIAN_ACTIVE_FREE_MB", 0)
 ACTIVE_HYSTERESIS_MB = _env_int("VRAM_GUARDIAN_ACTIVE_HYSTERESIS_MB", 2048)
 ACTIVE_RECLAIM_ON_EXIT = _env_bool("VRAM_GUARDIAN_ACTIVE_RECLAIM_ON_EXIT", True)
 ACTIVE_SCOPE = os.getenv("VRAM_GUARDIAN_ACTIVE_SCOPE", "prompt").strip().lower()
-SCHEDULER_PRESET = os.getenv("VRAM_GUARDIAN_SCHEDULER_PRESET", "heavy-video").strip().lower()
+SCHEDULER_PRESET = os.getenv("VRAM_GUARDIAN_SCHEDULER_PRESET", "manual").strip().lower()
 SCHEDULER_AUTO_PRESET = SCHEDULER_PRESET in {"auto", "default", "heavy", "heavy-video", "video"}
 SCHEDULER_OFF_PRESET = SCHEDULER_PRESET in {"0", "false", "manual", "no", "off", "disabled"}
 HEAVY_NODES = _env_name_set("VRAM_GUARDIAN_HEAVY_NODES")
@@ -1502,6 +1503,15 @@ def _install() -> None:
         LOG.info("VRAM Guardian plugin disabled by VRAM_GUARDIAN_ENABLED")
         return
     try:
+        if not AUTOMATION_ENABLED:
+            status = _guardian_request("status")
+            LOG.info(
+                "VRAM Guardian ComfyUI automation disabled; no prompt/node patches installed. "
+                "Use the guardian client or scripts/guardian_direct.sh for manual release/reserve. Status: %s",
+                status,
+            )
+            return
+
         _load_profile()
         _install_prompt_patch()
         _install_get_output_data_patch()
