@@ -85,11 +85,43 @@ def read_process_cwd(pid: int) -> str:
         return ""
 
 
+def read_process_namespace_pids(pid: int) -> set[int]:
+    pids = {pid}
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("NSpid:"):
+                    for value in line.split()[1:]:
+                        try:
+                            pids.add(int(value))
+                        except ValueError:
+                            pass
+                    break
+    except OSError:
+        pass
+    return pids
+
+
+def current_process_pid_aliases() -> set[int]:
+    return read_process_namespace_pids(os.getpid()) | {os.getpid()}
+
+
+def env_process_pid_aliases(name: str) -> set[int]:
+    aliases: set[int] = set()
+    for raw_pid in os.getenv(name, "").replace(",", " ").split():
+        try:
+            pid = int(raw_pid)
+        except ValueError:
+            continue
+        aliases.update(read_process_namespace_pids(pid))
+        aliases.add(pid)
+    return aliases
+
+
 def classify_process(pid: int, process_name: str, cmdline: str, cwd: str) -> str:
-    comfyui_pid = os.getenv("VRAM_GUARDIAN_COMFYUI_PID", "").strip()
-    if comfyui_pid and comfyui_pid == str(pid):
+    if pid in env_process_pid_aliases("VRAM_GUARDIAN_COMFYUI_PID"):
         return "comfyui"
-    if pid == os.getpid() or "vram_guardian.server" in cmdline:
+    if pid in current_process_pid_aliases() or "vram_guardian.server" in cmdline:
         return "guardian"
 
     text = f"{process_name} {cmdline} {cwd}"
@@ -549,9 +581,13 @@ class VramGuardian:
         process_summary = self.gpu_process_summary_unlocked()
         target_used = self.target_used_bytes_unlocked()
         target = self.target_bytes_unlocked()
+        guardian_pid_aliases = sorted(current_process_pid_aliases())
         data: dict[str, Any] = {
             "ok": True,
             "device": str(self.device),
+            "guardian_pid": os.getpid(),
+            "guardian_pid_aliases": guardian_pid_aliases,
+            "guardian_nvidia_smi_pid_candidates": [pid for pid in guardian_pid_aliases if pid != os.getpid()],
             "fraction": self.config.fraction,
             "chunk_mb": self.config.chunk_mb,
             "min_free_mb": self.config.min_free_mb,
