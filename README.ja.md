@@ -74,6 +74,34 @@ bash scripts/guardian_direct.sh stop
 bash scripts/guardian_direct.sh restart
 ```
 
+## CNB でのショートカット
+
+CNB では、この plugin を推奨ディレクトリに置きます。
+
+```bash
+/workspace/assets/vram-guardian-comfyui
+```
+
+`welcome.sh` が Guardian を起動すると、`vram-guardian` というショートカットコマンドが作成されます。その後は次のように手動で VRAM を操作できます。
+
+```bash
+vram-guardian status
+vram-guardian release 8
+vram-guardian reserve 8
+vram-guardian fill
+vram-guardian release-all
+```
+
+各コマンドの意味:
+
+- `vram-guardian status`: 現在の GPU VRAM 使用状況を表示し、Guardian の予約分、ComfyUI、その他プロセスを分けて確認します。
+- `vram-guardian release 8`: Guardian が予約している VRAM から `8 GiB` を解放します。
+- `vram-guardian reserve 8`: Guardian が最大 `8 GiB` を再予約します。ただし、設定された目標使用率は超えません。
+- `vram-guardian fill`: 目標使用率まで再予約します。デフォルトは GPU 全体の約 `98%` です。
+- `vram-guardian release-all`: Guardian が保持している VRAM をすべて解放します。
+
+注意: これらのコマンドが操作できるのは Guardian 自身が予約している VRAM だけです。ComfyUI やその他プロセスの VRAM を強制的に解放することはできません。解放された VRAM は通常の空き VRAM になり、他の CUDA process が取得する可能性があります。
+
 ## Python クライアント
 
 ```bash

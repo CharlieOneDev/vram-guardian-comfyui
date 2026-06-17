@@ -74,6 +74,34 @@ bash scripts/guardian_direct.sh stop
 bash scripts/guardian_direct.sh restart
 ```
 
+## CNB 中的快捷命令
+
+如果你把插件放在 CNB 的推荐目录：
+
+```bash
+/workspace/assets/vram-guardian-comfyui
+```
+
+并且 `welcome.sh` 已经启动过 Guardian，它会创建一个 `vram-guardian` 快捷命令。之后可以直接这样手动控制显存：
+
+```bash
+vram-guardian status
+vram-guardian release 8
+vram-guardian reserve 8
+vram-guardian fill
+vram-guardian release-all
+```
+
+命令含义：
+
+- `vram-guardian status`: 查看当前 GPU 显存占用，并区分 Guardian 预占、ComfyUI 和其它进程。
+- `vram-guardian release 8`: 从 Guardian 预占显存中释放 `8 GiB`。
+- `vram-guardian reserve 8`: 让 Guardian 重新预占最多 `8 GiB`，但不会超过配置的目标水位。
+- `vram-guardian fill`: 重新补满到目标水位，默认是 GPU 总占用约 `98%`。
+- `vram-guardian release-all`: 释放 Guardian 当前持有的全部显存。
+
+注意：这些命令只控制 Guardian 自己预占的显存。它不能强制 ComfyUI 或其它进程释放显存；释放出来的显存也会变成普通空闲显存，可能被其它 CUDA 进程拿走。
+
 ## Python 客户端
 
 如果你直接使用 Python 模块：
